@@ -177,8 +177,14 @@ export default function App() {
     if (storeGet(FACT_SHOWN_KEY) === todayKey) return;
     const dayIdx = Math.floor(Date.now() / 86400000) % FACTS.length; // ротация по дате
     setFactSplash(FACTS[dayIdx]);
-    storeSet(FACT_SHOWN_KEY, todayKey); // помечаем сразу, чтобы не показать дважды
+    // Важно: НЕ помечаем показанным здесь. Если страницу перезагрузит
+    // обновление PWA, факт покажется снова — иначе он «сгорает» непрочитанным.
   }, [settings]);
+
+  const dismissFact = () => {
+    storeSet(FACT_SHOWN_KEY, new Date().toDateString()); // прочитан — больше не показываем сегодня
+    setFactSplash(null);
+  };
 
   // Has today's entry already been logged? Считаем только по данным,
   // а не по флагу saved — иначе наутро приложение показывало бы
@@ -262,7 +268,7 @@ export default function App() {
         button:focus-visible{ outline:3px solid ${C.mint}; outline-offset:2px; }
       `}</style>
 
-      {factSplash && <FactSplash text={factSplash} onClose={() => setFactSplash(null)} />}
+      {factSplash && <FactSplash text={factSplash} onClose={dismissFact} />}
 
       <div className="phone" style={{
         width: 402, minHeight: "100vh", background: C.bg, position: "relative",
@@ -416,7 +422,10 @@ function FactSplash({ text, onClose }) {
   };
 
   useEffect(() => {
-    const t = setTimeout(close, 2600);
+    // Время показа зависит от длины текста: спокойный темп чтения
+    // (~70 мс на символ) плюс секунда на «включиться». Нажатие закрывает раньше.
+    const duration = Math.min(9000, Math.max(4500, 1200 + text.length * 70));
+    const t = setTimeout(close, duration);
     return () => clearTimeout(t);
   }, []);
 
