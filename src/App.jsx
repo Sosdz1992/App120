@@ -125,10 +125,13 @@ export default function App() {
 
   const insight = useMemo(() => {
     const sysArr = history.map((r) => r.sys);
+    // Все четыре фактора соревнуются на равных. `expected` — только для того,
+    // чтобы честно отметить неожиданный результат, а НЕ чтобы навязать направление.
     const cands = [
-      { key: "sleep", label: "сна", arr: history.map((r) => r.sleep) },
-      { key: "stress", label: "стресса", arr: history.map((r) => r.stress) },
-      { key: "salt", label: "солёной еды", arr: history.map((r) => r.salt) },
+      { key: "sleep", label: "сна", expected: -1, arr: history.map((r) => r.sleep) },
+      { key: "steps", label: "шагов", expected: -1, arr: history.map((r) => r.steps) },
+      { key: "stress", label: "стресса", expected: 1, arr: history.map((r) => r.stress) },
+      { key: "salt", label: "солёной еды", expected: 1, arr: history.map((r) => r.salt) },
     ].map((c) => ({ ...c, r: pearson(c.arr, sysArr) }));
     cands.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
     return cands[0];
@@ -370,30 +373,117 @@ function TimeSpin({ value, onUp, onDown, pad }) {
 }
 
 function BigStepper({ label, value, setValue, min, max, step }) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = React.useRef(null);
+
+  const beginEdit = () => { setDraft(String(value)); setEditing(true); };
+  const commit = () => {
+    const n = parseInt(draft, 10);
+    if (!isNaN(n)) setValue(Math.min(max, Math.max(min, n))); // держим в допустимых пределах
+    setEditing(false);
+  };
+
+  useEffect(() => {
+    if (editing && inputRef.current) { inputRef.current.focus(); inputRef.current.select(); }
+  }, [editing]);
+
   return (
     <div style={{ marginBottom: 12 }}>
       <span style={{ color: C.creamDim, fontSize: 13, display: "block", marginBottom: 7 }}>{label}</span>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <RoundBtn onClick={() => setValue(Math.max(min, value - step))}><Minus size={20} color={C.cream} /></RoundBtn>
-        <div style={{ flex: 1, textAlign: "center", background: C.bg, borderRadius: 12, padding: "10px 0", color: C.cream, fontSize: 22, fontWeight: 700 }}>{value}</div>
-        <RoundBtn onClick={() => setValue(Math.min(max, value + step))}><Plus size={20} color={C.cream} /></RoundBtn>
+        <RoundBtn ariaLabel="Уменьшить" onClick={() => setValue((v) => Math.max(min, v - step))}><Minus size={20} color={C.cream} /></RoundBtn>
+
+        {editing ? (
+          <input
+            ref={inputRef}
+            type="number"
+            inputMode="numeric"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commit}
+            onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
+            style={{
+              flex: 1, textAlign: "center", background: C.bg, borderRadius: 12, padding: "10px 0",
+              color: C.cream, fontSize: 22, fontWeight: 700, fontFamily: "inherit",
+              border: `2px solid ${C.mint}`, outline: "none", minWidth: 0,
+            }}
+          />
+        ) : (
+          <button
+            onClick={beginEdit}
+            aria-label={`${label}: ${value}. Нажмите, чтобы ввести число`}
+            style={{
+              flex: 1, textAlign: "center", background: C.bg, borderRadius: 12, padding: "10px 0",
+              color: C.cream, fontSize: 22, fontWeight: 700, fontFamily: "inherit",
+              border: `1px dashed ${C.line}`, cursor: "pointer",
+            }}
+          >{value}</button>
+        )}
+
+        <RoundBtn ariaLabel="Увеличить" onClick={() => setValue((v) => Math.min(max, v + step))}><Plus size={20} color={C.cream} /></RoundBtn>
       </div>
     </div>
   );
 }
 
-function RoundBtn({ children, onClick }) {
+// Кнопка с удержанием: нажал и держишь — значение меняется всё быстрее.
+function RoundBtn({ children, onClick, ariaLabel }) {
+  const timer = React.useRef(null);
+  const delay = React.useRef(300);
+
+  const stop = () => {
+    if (timer.current) { clearTimeout(timer.current); timer.current = null; }
+    delay.current = 300;
+  };
+
+  const start = (e) => {
+    e.preventDefault();       // не даём телефону выделять текст / зумить
+    onClick();                // первое нажатие — сразу
+    const tick = () => {
+      onClick();
+      delay.current = Math.max(40, delay.current * 0.75); // разгон
+      timer.current = setTimeout(tick, delay.current);
+    };
+    timer.current = setTimeout(tick, 400); // пауза перед автоповтором
+  };
+
+  React.useEffect(() => stop, []);
+
   return (
-    <button onClick={onClick} style={{
-      width: 48, height: 48, borderRadius: 14, background: C.panelSoft, border: `1px solid ${C.line}`,
-      display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
-    }}>{children}</button>
+    <button
+      aria-label={ariaLabel}
+      onPointerDown={start}
+      onPointerUp={stop}
+      onPointerLeave={stop}
+      onPointerCancel={stop}
+      onContextMenu={(e) => e.preventDefault()}
+      style={{
+        width: 48, height: 48, borderRadius: 14, background: C.panelSoft, border: `1px solid ${C.line}`,
+        display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0,
+        touchAction: "none", userSelect: "none", WebkitUserSelect: "none",
+      }}
+    >{children}</button>
   );
 }
 
 function FactorRow({ f, morning, value, setValue }) {
   const Icon = f.icon;
   const label = morning && f.labelMorning ? f.labelMorning : f.label;
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const inputRef = React.useRef(null);
+
+  const beginEdit = () => { setDraft(String(value)); setEditing(true); };
+  const commit = () => {
+    const n = f.step < 1 ? parseFloat(draft) : parseInt(draft, 10);
+    if (!isNaN(n)) setValue(Math.min(f.max, Math.max(f.min, n)));
+    setEditing(false);
+  };
+  useEffect(() => {
+    if (editing && inputRef.current) { inputRef.current.focus(); inputRef.current.select(); }
+  }, [editing]);
+
   if (f.type === "scale") {
     return (
       <div style={{ background: C.panel, borderRadius: 16, padding: "14px 16px", border: `1px solid ${C.line}` }}>
@@ -419,11 +509,35 @@ function FactorRow({ f, morning, value, setValue }) {
           <Icon size={17} color={C.mint} /><span style={{ color: C.cream, fontSize: 14.5, fontWeight: 500 }}>{label}</span>
         </span>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <RoundBtn onClick={() => setValue(Math.max(f.min, value - f.step))}><Minus size={18} color={C.cream} /></RoundBtn>
-          <span style={{ color: C.cream, fontSize: big ? 18 : 20, fontWeight: 700, minWidth: big ? 66 : 40, textAlign: "center" }}>
-            {big ? fmtNum(value) : value}
-          </span>
-          <RoundBtn onClick={() => setValue(Math.min(f.max, value + f.step))}><Plus size={18} color={C.cream} /></RoundBtn>
+          <RoundBtn ariaLabel="Уменьшить" onClick={() => setValue((v) => Math.max(f.min, +(v - f.step).toFixed(1)))}><Minus size={18} color={C.cream} /></RoundBtn>
+          {editing ? (
+            <input
+              ref={inputRef}
+              type="number"
+              inputMode={f.step < 1 ? "decimal" : "numeric"}
+              step={f.step}
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commit}
+              onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
+              style={{
+                width: big ? 78 : 56, textAlign: "center", background: C.bg, borderRadius: 9, padding: "6px 2px",
+                color: C.cream, fontSize: big ? 17 : 19, fontWeight: 700, fontFamily: "inherit",
+                border: `2px solid ${C.mint}`, outline: "none",
+              }}
+            />
+          ) : (
+            <button
+              onClick={beginEdit}
+              aria-label={`${label}: ${value}. Нажмите, чтобы ввести число`}
+              style={{
+                background: "transparent", border: `1px dashed ${C.line}`, borderRadius: 9, padding: "6px 8px",
+                color: C.cream, fontSize: big ? 18 : 20, fontWeight: 700, minWidth: big ? 74 : 52,
+                textAlign: "center", cursor: "pointer", fontFamily: "inherit",
+              }}
+            >{big ? fmtNum(value) : value}</button>
+          )}
+          <RoundBtn ariaLabel="Увеличить" onClick={() => setValue((v) => Math.min(f.max, +(v + f.step).toFixed(1)))}><Plus size={18} color={C.cream} /></RoundBtn>
         </div>
       </div>
       {big && <p style={{ color: C.creamDim, fontSize: 11, margin: "9px 0 0" }}>Позже — автоматически с часов или телефона</p>}
@@ -559,10 +673,28 @@ function InsightView({ history, insight, daysLogged }) {
   const avgLo = lo.length ? Math.round(lo.reduce((a, b) => a + b, 0) / lo.length) : 0;
   const gap = Math.abs(avgHi - avgLo);
 
-  const copy = {
-    sleep: { hi: "в дни, когда вы хорошо выспались,", lo: "в дни недосыпа", nudge: "Похоже, полноценный сон — один из самых сильных рычагов для вас. Постарайтесь ложиться в одно и то же время." },
-    stress: { hi: "в напряжённые дни", lo: "в спокойные дни", nudge: "В трудные дни попробуйте несколько минут спокойствия перед сном — это может помочь." },
-    salt: { hi: "в дни с солёной едой", lo: "в дни с лёгкой едой", nudge: "Немного меньше соли несколько дней в неделю — маленький и выполнимый шаг для начала." },
+  // Направление берём ИЗ ДАННЫХ, а не из ожиданий.
+  const higherOnMore = avgHi > avgLo;           // больше фактора → давление выше?
+  const dirWord = higherOnMore ? "выше" : "ниже";
+  const dataSign = higherOnMore ? 1 : -1;
+  // Неожиданно = данные разошлись с обычным медицинским ожиданием.
+  const unexpected = insight.expected !== 0 && dataSign !== insight.expected;
+
+  // Описания групп — нейтральные, без намёка на давление.
+  const groups = {
+    sleep: { more: "В дни, когда вы спали дольше", less: "в дни, когда вы спали меньше" },
+    steps: { more: "В дни, когда вы больше ходили", less: "в дни, когда вы ходили меньше" },
+    stress: { more: "В более напряжённые дни", less: "в спокойные дни" },
+    salt: { more: "В дни с солёной едой", less: "в дни с лёгкой едой" },
+  }[factorKey];
+
+  // Подсказка следует за данными. При неожиданном направлении — не советуем
+  // ничего менять, а предлагаем продолжить наблюдение и спросить врача.
+  const nudgeExpected = {
+    sleep: "Похоже, сон — один из ваших сильных рычагов. Попробуйте ложиться в одно и то же время.",
+    steps: "Похоже, ходьба вам заметно помогает. Даже небольшая ежедневная прогулка — хороший шаг.",
+    stress: "В напряжённые дни попробуйте несколько минут спокойствия перед сном.",
+    salt: "Немного меньше соли несколько дней в неделю — маленький и выполнимый шаг.",
   }[factorKey];
 
   return (
@@ -572,7 +704,7 @@ function InsightView({ history, insight, daysLogged }) {
           <Sparkles size={15} /> Ваша закономерность
         </span>
         <h2 style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 23, fontWeight: 500, lineHeight: 1.3, margin: "12px 0 8px" }}>
-          {copy.hi} давление примерно <span style={{ color: C.coral }}>на {gap} единиц выше</span>, чем {copy.lo}.
+          {groups.more} давление примерно <span style={{ color: C.coral }}>на {gap} единиц {dirWord}</span>, чем {groups.less}.
         </h2>
         <p style={{ color: C.creamDim, fontSize: 13, margin: "6px 0 0" }}>
           За {daysLogged} дней видна {strengthLabel} между вашим уровнем {insight.label} и давлением.
@@ -589,19 +721,25 @@ function InsightView({ history, insight, daysLogged }) {
               return <line x1={px(xMin)} y1={py(slope * xMin + b)} x2={px(xMax)} y2={py(slope * xMax + b)} stroke={C.mint} strokeWidth={2} strokeDasharray="5 4" opacity={0.8} />;
             })()}
             {pts.map((p, i) => <circle key={i} cx={px(p.x)} cy={py(p.y)} r={4} fill={C.coral} opacity={0.75} />)}
-            <text x={0} y={H + 18} fill={C.creamDim} fontSize={10}>меньше</text>
-            <text x={W} y={H + 18} fill={C.creamDim} fontSize={10} textAnchor="end">больше</text>
+            <text x={0} y={H + 18} fill={C.creamDim} fontSize={10}>меньше {insight.label}</text>
+            <text x={W} y={H + 18} fill={C.creamDim} fontSize={10} textAnchor="end">больше {insight.label}</text>
           </svg>
         </div>
       </div>
 
-      <div style={{ background: C.panel, borderRadius: 18, padding: "16px", border: `1px solid ${C.line}`, marginTop: 12, display: "flex", gap: 12 }}>
-        <div style={{ minWidth: 36, height: 36, borderRadius: 10, background: `${C.mint}1E`, display: "flex", alignItems: "center", justifyContent: "center" }}>
-          <TrendingDown size={19} color={C.mint} />
+      <div style={{ background: C.panel, borderRadius: 18, padding: "16px", border: `1px solid ${unexpected ? C.warn + "66" : C.line}`, marginTop: 12, display: "flex", gap: 12 }}>
+        <div style={{ minWidth: 36, height: 36, borderRadius: 10, background: unexpected ? `${C.warn}1E` : `${C.mint}1E`, display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "flex-start" }}>
+          {unexpected ? <Info size={19} color={C.warn} /> : <TrendingDown size={19} color={C.mint} />}
         </div>
         <div>
-          <p style={{ color: C.cream, fontSize: 14, fontWeight: 600, margin: "0 0 4px" }}>Что можно попробовать</p>
-          <p style={{ color: C.creamDim, fontSize: 13, margin: 0, lineHeight: 1.55 }}>{copy.nudge}</p>
+          <p style={{ color: C.cream, fontSize: 14, fontWeight: 600, margin: "0 0 4px" }}>
+            {unexpected ? "Неожиданный результат" : "Что можно попробовать"}
+          </p>
+          <p style={{ color: C.creamDim, fontSize: 13, margin: 0, lineHeight: 1.55 }}>
+            {unexpected
+              ? "Обычно это работает наоборот. За несколько недель такое часто оказывается случайностью — продолжайте вести дневник и покажите эту картину врачу. Не меняйте привычки только из-за этого наблюдения."
+              : nudgeExpected}
+          </p>
         </div>
       </div>
 
