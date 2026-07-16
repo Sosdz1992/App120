@@ -40,6 +40,7 @@ function persist(entries) {
 }
 
 const SETTINGS_KEY = "davlenie_settings_v1";
+const FACT_SHOWN_KEY = "davlenie_fact_shown_v1";
 function loadSettings() {
   try {
     const raw = storeGet(SETTINGS_KEY);
@@ -60,6 +61,22 @@ const FACTS = [
   "Кофе может временно поднять давление — измеряйте не раньше чем через 30 минут после чашки.",
   "Приём лекарств в одно и то же время каждый день делает лечение заметно эффективнее.",
   "Давление меняется в течение дня — одно высокое измерение ещё не диагноз. Важна общая картина.",
+  "Во время измерения спина должна опираться на спинку стула, а рука — лежать на столе на уровне сердца.",
+  "Манжета на запястье менее точна, чем на плече. Если есть выбор — измеряйте на плече.",
+  "Разговор во время измерения может прибавить несколько единиц. Лучше минуту помолчать.",
+  "Полный мочевой пузырь может заметно повысить показания — лучше измерять после туалета.",
+  "Большая часть соли приходит не из солонки, а из хлеба, сыра, колбасы и готовой еды.",
+  "Калий помогает выводить лишний натрий. Его много в бананах, картофеле, кураге и фасоли.",
+  "Даже 10–15 минут ходьбы после еды — вклад в ваше давление. Необязательно сразу 10 000 шагов.",
+  "Алкоголь повышает давление на следующий день — даже небольшие дозы влияют на утренние показания.",
+  "Курение поднимает давление на 15–30 минут после каждой сигареты и ускоряет износ сосудов.",
+  "Лишний вес — нагрузка на сосуды. Снижение даже на несколько килограммов часто отражается на давлении.",
+  "Глубокое медленное дыхание в течение пары минут может немного снизить давление здесь и сейчас.",
+  "Холодная погода слегка повышает давление — зимой показания часто чуть выше, это нормально.",
+  "Первое измерение часто выше последующих. Врачи советуют сделать два и записать среднее.",
+  "«Гипертония белого халата» — у многих давление у врача выше, чем дома. Домашний дневник помогает это увидеть.",
+  "Пропуск лекарства на один день может отражаться на давлении ещё несколько дней.",
+  "Регулярный сон в одно и то же время помогает давлению не меньше, чем его длительность.",
 ];
 
 const FACTORS = [
@@ -98,6 +115,47 @@ function pearson(xs, ys) {
 
 const fmtNum = (n) => n.toLocaleString("ru-RU");
 
+// Склонение: 1 день, 2 дня, 5 дней, 11 дней…
+const pluralDays = (n) => {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return "день";
+  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return "дня";
+  return "дней";
+};
+const pluralZapisey = (n) => {
+  const m10 = n % 10, m100 = n % 100;
+  if (m10 === 1 && m100 !== 11) return "запись";
+  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return "записи";
+  return "записей";
+};
+
+// Дни недели в винительном падеже, с правильным предлогом.
+const WEEKDAYS_ACC = ["в воскресенье", "в понедельник", "во вторник", "в среду", "в четверг", "в пятницу", "в субботу"];
+
+// Микро-наблюдения до первой закономерности: только факты из данных,
+// никаких выводов и никаких «закономерностей» раньше времени.
+function microObservations(history) {
+  const obs = [];
+  if (history.length >= 3) {
+    const lowest = history.reduce((a, b) => (b.sys < a.sys ? b : a));
+    obs.push({
+      icon: "low",
+      text: `Самое низкое давление было ${WEEKDAYS_ACC[new Date(lowest.date).getDay()]} — ${lowest.sys}/${lowest.dia}`,
+    });
+  }
+  if (history.length >= 5) {
+    const last7 = history.slice(-7);
+    const avgS = Math.round(last7.reduce((s, r) => s + r.sys, 0) / last7.length);
+    const avgD = Math.round(last7.reduce((s, r) => s + r.dia, 0) / last7.length);
+    obs.push({ icon: "avg", text: `Среднее по последним ${last7.length} записям — ${avgS}/${avgD}` });
+  }
+  if (history.length >= 3) {
+    const taken = history.filter((r) => r.taken).length;
+    obs.push({ icon: "med", text: `Лекарство отмечено принятым ${taken} из ${history.length} ${pluralDays(history.length)}` });
+  }
+  return obs.slice(0, 3);
+}
+
 export default function App() {
   const [tab, setTab] = useState("log");
   const [history, setHistory] = useState(() => loadEntries() || (DEMO_MODE ? makeHistory() : []));
@@ -110,6 +168,17 @@ export default function App() {
 
   useEffect(() => { persist(history); }, [history]);
   useEffect(() => { if (settings) persistSettings(settings); }, [settings]);
+
+  // Факт дня при запуске: показываем один раз в день, при первом открытии.
+  const [factSplash, setFactSplash] = useState(null);
+  useEffect(() => {
+    if (!settings) return; // не поверх экрана настройки
+    const todayKey = new Date().toDateString();
+    if (storeGet(FACT_SHOWN_KEY) === todayKey) return;
+    const dayIdx = Math.floor(Date.now() / 86400000) % FACTS.length; // ротация по дате
+    setFactSplash(FACTS[dayIdx]);
+    storeSet(FACT_SHOWN_KEY, todayKey); // помечаем сразу, чтобы не показать дважды
+  }, [settings]);
 
   // Has today's entry already been logged? Считаем только по данным,
   // а не по флагу saved — иначе наутро приложение показывало бы
@@ -143,7 +212,26 @@ export default function App() {
   }, [history]);
 
   const daysLogged = history.length;
-  const progress = Math.min(100, Math.round((daysLogged / 60) * 100));
+
+  // Мягкая серия: сколько записей за последние 14 календарных дней
+  // (окно короче, если дневник ведётся меньше двух недель).
+  // Никогда не «сгорает» — пропуск просто уменьшает счёт на единицу.
+  const streak = useMemo(() => {
+    if (history.length === 0) return null;
+    const now = Date.now();
+    const first = new Date(history[0].date).getTime();
+    const windowDays = Math.min(14, Math.floor((now - first) / 86400000) + 1);
+    const count = history.filter((r) => now - new Date(r.date).getTime() < windowDays * 86400000).length;
+    return { count: Math.min(count, windowDays), windowDays };
+  }, [history]);
+
+  // До 14 дней прогресс ведёт к первой закономерности, после — к полной картине.
+  const INSIGHT_GATE = 14;
+  const toInsight = daysLogged < INSIGHT_GATE;
+  const daysLeft = INSIGHT_GATE - daysLogged;
+  const progress = toInsight
+    ? Math.round((daysLogged / INSIGHT_GATE) * 100)
+    : Math.min(100, Math.round((daysLogged / 60) * 100));
   const fact = FACTS[daysLogged % FACTS.length];
 
   const saveEntry = () => {
@@ -174,6 +262,8 @@ export default function App() {
         button:focus-visible{ outline:3px solid ${C.mint}; outline-offset:2px; }
       `}</style>
 
+      {factSplash && <FactSplash text={factSplash} onClose={() => setFactSplash(null)} />}
+
       <div className="phone" style={{
         width: 402, minHeight: "100vh", background: C.bg, position: "relative",
         overflowY: "auto", borderLeft: `1px solid ${C.line}`, borderRight: `1px solid ${C.line}`, paddingBottom: 40,
@@ -185,8 +275,17 @@ export default function App() {
             <span style={{ color: C.cream, fontWeight: 700, fontSize: 17 }}>120 app</span>
           </div>
           <p style={{ color: C.creamDim, fontSize: 13.5, margin: "5px 0 0", paddingLeft: 29 }}>
-            {daysLogged} дней наблюдений
+            {daysLogged === 0
+              ? "Начните с первой записи"
+              : `${daysLogged} ${pluralDays(daysLogged)} наблюдений`}
           </p>
+          {streak && streak.windowDays >= 4 && streak.count > 0 && (
+            <p style={{ color: streak.count === streak.windowDays ? C.mint : C.creamDim, fontSize: 12, margin: "3px 0 0", paddingLeft: 29 }}>
+              {streak.count === streak.windowDays
+                ? `Все ${streak.windowDays} ${pluralDays(streak.windowDays)} без пропусков — так держать`
+                : `${streak.count} ${pluralZapisey(streak.count)} за последние ${streak.windowDays} ${pluralDays(streak.windowDays)}`}
+            </p>
+          )}
         </div>
 
         {/* Progress */}
@@ -195,7 +294,9 @@ export default function App() {
             <div style={{ width: `${progress}%`, height: "100%", background: `linear-gradient(90deg, ${C.mintDim}, ${C.mint})`, borderRadius: 99, transition: "width .5s" }} />
           </div>
           <p style={{ color: C.mintDim, fontSize: 12, margin: "7px 2px 0" }}>
-            {progress}% пути к полной картине за 3 месяца
+            {toInsight
+              ? `До первой закономерности — ${daysLeft} ${pluralDays(daysLeft)}`
+              : `${progress}% пути к полной картине за 3 месяца`}
           </p>
         </div>
 
@@ -296,6 +397,58 @@ export default function App() {
 
         {tab === "trend" && <TrendView history={history} fact={fact} />}
         {tab === "insight" && <InsightView history={history} insight={insight} daysLogged={daysLogged} />}
+      </div>
+    </div>
+  );
+}
+
+// Факт дня при запуске: плавно появляется, исчезает сам через ~2.5 секунды,
+// нажатие в любом месте закрывает сразу. Никогда не блокирует пользователя.
+function FactSplash({ text, onClose }) {
+  const [leaving, setLeaving] = useState(false);
+  const closingRef = React.useRef(false);
+
+  const close = () => {
+    if (closingRef.current) return;
+    closingRef.current = true;
+    setLeaving(true);
+    setTimeout(onClose, 350); // даём фейду закончиться
+  };
+
+  useEffect(() => {
+    const t = setTimeout(close, 2600);
+    return () => clearTimeout(t);
+  }, []);
+
+  return (
+    <div
+      onClick={close}
+      role="button"
+      aria-label="Факт дня. Нажмите, чтобы продолжить"
+      style={{
+        position: "fixed", inset: 0, zIndex: 50, background: C.bg,
+        display: "flex", alignItems: "center", justifyContent: "center",
+        opacity: leaving ? 0 : 1, transition: "opacity .35s ease",
+        cursor: "pointer", animation: "factIn .45s ease",
+      }}
+    >
+      <style>{`@keyframes factIn { from { opacity: 0 } to { opacity: 1 } }`}</style>
+      <div style={{ maxWidth: 340, padding: "0 28px", textAlign: "center" }}>
+        <div style={{
+          width: 56, height: 56, borderRadius: 18, background: `${C.mint}1E`,
+          display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 18px",
+        }}>
+          <Lightbulb size={26} color={C.mint} />
+        </div>
+        <p style={{ color: C.mint, fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, margin: "0 0 10px" }}>
+          Полезно знать
+        </p>
+        <p style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 20, fontWeight: 500, lineHeight: 1.45, margin: 0 }}>
+          {text}
+        </p>
+        <p style={{ color: C.creamDim, fontSize: 11, margin: "26px 0 0", opacity: 0.7 }}>
+          Нажмите, чтобы продолжить
+        </p>
       </div>
     </div>
   );
@@ -657,21 +810,56 @@ function Legend({ color, label }) {
 }
 
 function InsightView({ history, insight, daysLogged }) {
-  // Не показываем «закономерность» по 2–3 дням — это вводило бы в заблуждение.
-  if (daysLogged < 7) {
-    const left = 7 - daysLogged;
+  // Не показываем «закономерность» раньше 14 дней: четыре фактора соревнуются,
+  // и на малой выборке «победитель» слишком часто оказывается случайным.
+  if (daysLogged < 14) {
+    const left = 14 - daysLogged;
+    const obs = microObservations(history);
+    const obsIcons = { low: TrendingDown, avg: Sparkles, med: Pill };
     return (
       <div style={{ padding: "12px 18px 0" }}>
         <div style={{ background: `linear-gradient(160deg, ${C.panelSoft}, ${C.panel})`, borderRadius: 22, padding: "26px 20px", border: `1px solid ${C.mintDim}55`, textAlign: "center" }}>
           <Sparkles size={22} color={C.mint} style={{ marginBottom: 10 }} />
           <p style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 21, fontWeight: 500, lineHeight: 1.35, margin: "0 0 8px" }}>
-            Собираем вашу картину
+            {left <= 3 ? "Почти готово" : "Собираем вашу картину"}
           </p>
-          <p style={{ color: C.creamDim, fontSize: 13.5, margin: 0, lineHeight: 1.6 }}>
-            Первые закономерности появятся примерно через {left} {left === 1 ? "день" : left < 5 ? "дня" : "дней"} записей.
-            Чем дольше вы ведёте дневник, тем точнее картина.
+          <p style={{ color: C.creamDim, fontSize: 13.5, margin: "0 0 18px", lineHeight: 1.6 }}>
+            Ещё {left} {pluralZapisey(left)} — и появится ваша первая закономерность.
           </p>
+          {/* 14 точек: заполненные — дни с записями */}
+          <div style={{ display: "flex", justifyContent: "center", gap: 6, flexWrap: "wrap" }}>
+            {Array.from({ length: 14 }, (_, i) => (
+              <span key={i} style={{
+                width: 10, height: 10, borderRadius: 99,
+                background: i < daysLogged ? C.mint : "transparent",
+                border: `1.5px solid ${i < daysLogged ? C.mint : C.line}`,
+                transition: "all .3s",
+              }} />
+            ))}
+          </div>
         </div>
+
+        {obs.length > 0 && (
+          <>
+            <p style={{ color: C.creamDim, fontSize: 12.5, margin: "20px 4px 10px", textTransform: "uppercase", letterSpacing: 0.6 }}>
+              А пока — из ваших записей
+            </p>
+            {obs.map((o, i) => {
+              const OIcon = obsIcons[o.icon] || Sparkles;
+              return (
+                <div key={i} style={{ background: C.panel, borderRadius: 16, padding: "14px 16px", border: `1px solid ${C.line}`, marginBottom: 8, display: "flex", gap: 12, alignItems: "flex-start" }}>
+                  <div style={{ minWidth: 32, height: 32, borderRadius: 9, background: `${C.mint}1A`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <OIcon size={16} color={C.mint} />
+                  </div>
+                  <p style={{ color: C.cream, fontSize: 13.5, margin: "5px 0 0", lineHeight: 1.5 }}>{o.text}</p>
+                </div>
+              );
+            })}
+            <p style={{ color: C.creamDim, fontSize: 11, margin: "10px 4px 0", opacity: 0.8, lineHeight: 1.5 }}>
+              Это просто наблюдения, а не выводы — выводы появятся, когда данных станет больше.
+            </p>
+          </>
+        )}
       </div>
     );
   }
