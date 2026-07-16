@@ -63,10 +63,13 @@ const FACTS = [
 ];
 
 const FACTORS = [
-  { key: "sleep", label: "Сон", labelMorning: "Сон этой ночью", icon: Moon, unit: "ч", min: 3, max: 11, step: 0.5, def: 7, type: "stepper" },
+  { key: "sleep", label: "Сон", labelMorning: "Сон этой ночью", icon: Moon, unit: "ч", suffix: "ч", min: 3, max: 11, step: 0.5, def: 7, type: "stepper",
+    hint: "Количество часов, которое вы спали" },
   { key: "steps", label: "Шаги", labelMorning: "Шаги вчера", icon: Footprints, unit: "", min: 0, max: 20000, step: 500, def: 3000, type: "steps" },
-  { key: "stress", label: "Стресс", labelMorning: "Стресс вчера", icon: Brain, unit: "из 5", min: 1, max: 5, step: 1, def: 3, type: "scale" },
-  { key: "salt", label: "Солёная еда", labelMorning: "Солёная еда вчера", icon: Utensils, unit: "из 5", min: 1, max: 5, step: 1, def: 2, type: "scale" },
+  { key: "stress", label: "Стресс", labelMorning: "Стресс вчера", icon: Brain, unit: "из 5", min: 1, max: 5, step: 1, def: 3, type: "scale",
+    hint: "1 — спокойный день · 5 — очень тяжёлый" },
+  { key: "salt", label: "Солёная еда", labelMorning: "Солёная еда вчера", icon: Utensils, unit: "из 5", min: 1, max: 5, step: 1, def: 2, type: "scale",
+    hint: "1 — почти без соли · 5 — колбаса, сыр, соленья" },
 ];
 
 function makeHistory() {
@@ -108,11 +111,13 @@ export default function App() {
   useEffect(() => { persist(history); }, [history]);
   useEffect(() => { if (settings) persistSettings(settings); }, [settings]);
 
-  // Has today's entry already been logged? (drives reminder banner)
+  // Has today's entry already been logged? Считаем только по данным,
+  // а не по флагу saved — иначе наутро приложение показывало бы
+  // «сохранено», хотя новой записи ещё нет.
   const loggedToday = useMemo(() => {
     const today = new Date().toDateString();
-    return history.some((r) => new Date(r.date).toDateString() === today) || saved;
-  }, [history, saved]);
+    return history.some((r) => new Date(r.date).toDateString() === today);
+  }, [history]);
 
   // Classified by the HIGHER of the two values (ESH-style grading).
   const bpBand = useMemo(() => {
@@ -148,6 +153,7 @@ export default function App() {
     setHistory((h) => [...h.filter((r) => new Date(r.date).toDateString() !== todayStr), entry]);
     setSaved(true);
     setTimeout(() => setTab("insight"), 600);
+    setTimeout(() => setSaved(false), 2000); // «Сохранено» — короткое подтверждение, не постоянное состояние
   };
 
   // First run: pick the daily reading time before anything else.
@@ -261,7 +267,17 @@ export default function App() {
             <p style={{ color: C.creamDim, fontSize: 12.5, margin: "22px 4px 11px", textTransform: "uppercase", letterSpacing: 0.6 }}>{morning ? "Как прошёл вчерашний день" : "Как прошёл день"}</p>
             <div style={{ display: "grid", gap: 10 }}>
               {FACTORS.map((f) => (
-                <FactorRow key={f.key} f={f} morning={morning} value={factors[f.key]} setValue={(v) => setFactors((s) => ({ ...s, [f.key]: v }))} />
+                <FactorRow
+                  key={f.key}
+                  f={f}
+                  morning={morning}
+                  value={factors[f.key]}
+                  // Поддерживаем и значение, и функцию-обновление (нужно для удержания кнопки).
+                  setValue={(next) => setFactors((s) => ({
+                    ...s,
+                    [f.key]: typeof next === "function" ? next(s[f.key]) : next,
+                  }))}
+                />
               ))}
             </div>
 
@@ -270,7 +286,7 @@ export default function App() {
               padding: "18px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
               display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
             }}>
-              {saved ? <><Check size={20} strokeWidth={3} /> Сохранено</> : "Сохранить запись"}
+              {saved ? <><Check size={20} strokeWidth={3} /> Сохранено</> : loggedToday ? "Обновить запись" : "Сохранить запись"}
             </button>
             <p style={{ color: C.creamDim, fontSize: 11.5, textAlign: "center", margin: "13px 8px 8px", lineHeight: 1.5 }}>
               Приложение помогает замечать ваши собственные закономерности. Оно не заменяет врача — обсуждайте измерения с лечащим врачом.
@@ -397,10 +413,10 @@ function BigStepper({ label, value, setValue, min, max, step }) {
         {editing ? (
           <input
             ref={inputRef}
-            type="number"
+            type="text"
             inputMode="numeric"
             value={draft}
-            onChange={(e) => setDraft(e.target.value)}
+            onChange={(e) => setDraft(e.target.value.replace(/[^\d]/g, ""))}
             onBlur={commit}
             onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
             style={{
@@ -476,7 +492,9 @@ function FactorRow({ f, morning, value, setValue }) {
 
   const beginEdit = () => { setDraft(String(value)); setEditing(true); };
   const commit = () => {
-    const n = f.step < 1 ? parseFloat(draft) : parseInt(draft, 10);
+    // Русская клавиатура часто даёт запятую: «6,5» → приводим к точке.
+    const cleaned = draft.replace(",", ".");
+    const n = f.step < 1 ? parseFloat(cleaned) : parseInt(cleaned, 10);
     if (!isNaN(n)) setValue(Math.min(f.max, Math.max(f.min, n)));
     setEditing(false);
   };
@@ -498,6 +516,9 @@ function FactorRow({ f, morning, value, setValue }) {
             }}>{n}</button>
           ))}
         </div>
+        {f.hint && (
+          <p style={{ color: C.creamDim, fontSize: 10.5, margin: "8px 2px 0", opacity: 0.75, lineHeight: 1.4 }}>{f.hint}</p>
+        )}
       </div>
     );
   }
@@ -513,11 +534,10 @@ function FactorRow({ f, morning, value, setValue }) {
           {editing ? (
             <input
               ref={inputRef}
-              type="number"
+              type="text"
               inputMode={f.step < 1 ? "decimal" : "numeric"}
-              step={f.step}
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => setDraft(e.target.value.replace(/[^\d.,]/g, ""))}
               onBlur={commit}
               onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
               style={{
@@ -532,14 +552,15 @@ function FactorRow({ f, morning, value, setValue }) {
               aria-label={`${label}: ${value}. Нажмите, чтобы ввести число`}
               style={{
                 background: "transparent", border: `1px dashed ${C.line}`, borderRadius: 9, padding: "6px 8px",
-                color: C.cream, fontSize: big ? 18 : 20, fontWeight: 700, minWidth: big ? 74 : 52,
+                color: C.cream, fontSize: big ? 18 : 20, fontWeight: 700, minWidth: big ? 74 : 66,
                 textAlign: "center", cursor: "pointer", fontFamily: "inherit",
               }}
-            >{big ? fmtNum(value) : value}</button>
+            >{big ? fmtNum(value) : value}{f.suffix ? ` ${f.suffix}` : ""}</button>
           )}
           <RoundBtn ariaLabel="Увеличить" onClick={() => setValue((v) => Math.min(f.max, +(v + f.step).toFixed(1)))}><Plus size={18} color={C.cream} /></RoundBtn>
         </div>
       </div>
+      {f.hint && <p style={{ color: C.creamDim, fontSize: 10.5, margin: "8px 0 0", opacity: 0.75, lineHeight: 1.4 }}>{f.hint}</p>}
       {big && <p style={{ color: C.creamDim, fontSize: 11, margin: "9px 0 0" }}>Позже — автоматически с часов или телефона</p>}
     </div>
   );
@@ -678,7 +699,8 @@ function InsightView({ history, insight, daysLogged }) {
   const dirWord = higherOnMore ? "выше" : "ниже";
   const dataSign = higherOnMore ? 1 : -1;
   // Неожиданно = данные разошлись с обычным медицинским ожиданием.
-  const unexpected = insight.expected !== 0 && dataSign !== insight.expected;
+  // При нулевой разнице направления нет — нечего и флагать.
+  const unexpected = gap > 0 && insight.expected !== 0 && dataSign !== insight.expected;
 
   // Описания групп — нейтральные, без намёка на давление.
   const groups = {
@@ -704,7 +726,9 @@ function InsightView({ history, insight, daysLogged }) {
           <Sparkles size={15} /> Ваша закономерность
         </span>
         <h2 style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 23, fontWeight: 500, lineHeight: 1.3, margin: "12px 0 8px" }}>
-          {groups.more} давление примерно <span style={{ color: C.coral }}>на {gap} единиц {dirWord}</span>, чем {groups.less}.
+          {gap === 0
+            ? <>{groups.more} и {groups.less} давление у вас <span style={{ color: C.coral }}>практически одинаковое</span>.</>
+            : <>{groups.more} давление примерно <span style={{ color: C.coral }}>на {gap} единиц {dirWord}</span>, чем {groups.less}.</>}
         </h2>
         <p style={{ color: C.creamDim, fontSize: 13, margin: "6px 0 0" }}>
           За {daysLogged} дней видна {strengthLabel} между вашим уровнем {insight.label} и давлением.
