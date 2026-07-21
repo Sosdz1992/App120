@@ -2,7 +2,7 @@ import React, { useState, useMemo, useEffect } from "react";
 import {
   Moon, Footprints, Brain, Utensils, Pill, Heart, ChevronRight,
   Check, Sparkles, TrendingDown, Info, Plus, Minus, Lightbulb,
-  Clock, Bell, Sun
+  Clock, Bell, Sun, Wine
 } from "lucide-react";
 
 // ---- Design tokens -----------------------------------------------------
@@ -89,6 +89,15 @@ const FACTORS = [
     hint: "1 — почти без соли · 5 — колбаса, сыр, соленья" },
 ];
 
+// Алкоголь — необязательный фактор: появляется только если в профиле
+// человек ответил «да» на вопрос об алкоголе. Шкала грубая — так честнее отвечают.
+const ALCOHOL_FACTOR = {
+  key: "alcohol", label: "Алкоголь", labelMorning: "Алкоголь вчера", icon: Wine,
+  type: "choice", def: 0,
+  options: [{ v: 0, l: "нет" }, { v: 1, l: "немного" }, { v: 2, l: "прилично" }],
+};
+const ALL_FACTORS = [...FACTORS, ALCOHOL_FACTOR];
+
 function makeHistory() {
   const rows = [];
   const base = new Date();
@@ -158,28 +167,61 @@ function microObservations(history) {
 
 export default function App() {
   const [tab, setTab] = useState("log");
-  const [history, setHistory] = useState(() => loadEntries() || (DEMO_MODE ? makeHistory() : []));
-  const [sys, setSys] = useState(128);
-  const [dia, setDia] = useState(82);
-  const [factors, setFactors] = useState(Object.fromEntries(FACTORS.map((f) => [f.key, f.def])));
-  const [medTaken, setMedTaken] = useState(true);
+  // Загружаем записи один раз; если сегодня уже есть запись —
+  // форма стартует с её значениями, а не с «128/82 по умолчанию».
+  const initialRef = React.useRef(null);
+  if (initialRef.current === null) {
+    const entries = loadEntries() || (DEMO_MODE ? makeHistory() : []);
+    const t = new Date().toDateString();
+    initialRef.current = {
+      entries,
+      today: entries.find((r) => new Date(r.date).toDateString() === t) || null,
+    };
+  }
+  const { entries: initialEntries, today: todayEntry } = initialRef.current;
+
+  const [history, setHistory] = useState(initialEntries);
+  const [sys, setSys] = useState(todayEntry ? todayEntry.sys : 128);
+  const [dia, setDia] = useState(todayEntry ? todayEntry.dia : 82);
+  const [factors, setFactors] = useState(() =>
+    Object.fromEntries(ALL_FACTORS.map((f) => [f.key, todayEntry && todayEntry[f.key] != null ? todayEntry[f.key] : f.def]))
+  );
+  const [medTaken, setMedTaken] = useState(todayEntry ? !!todayEntry.taken : true);
   const [saved, setSaved] = useState(false);
+  const [askUpdate, setAskUpdate] = useState(false);
+  const [showProfileFlow, setShowProfileFlow] = useState(false);
+  const [profilePromptHidden, setProfilePromptHidden] = useState(false);
   const [settings, setSettings] = useState(() => loadSettings());
+
+  // Факторы, которые реально показываем: алкоголь — только для тех, кто пьёт.
+  const activeFactors = useMemo(
+    () => (settings?.profile?.alcohol === "yes" ? ALL_FACTORS : FACTORS),
+    [settings]
+  );
 
   useEffect(() => { persist(history); }, [history]);
   useEffect(() => { if (settings) persistSettings(settings); }, [settings]);
+
+  // «Сердцебиение» текущего дня: Android может держать приложение в памяти
+  // сутками, и без этого всё, что зависит от «сегодня», застывает во вчера.
+  const [todayStr, setTodayStr] = useState(() => new Date().toDateString());
+  useEffect(() => {
+    const upd = () => setTodayStr(new Date().toDateString());
+    const iv = setInterval(upd, 60000);
+    document.addEventListener("visibilitychange", upd);
+    return () => { clearInterval(iv); document.removeEventListener("visibilitychange", upd); };
+  }, []);
 
   // Факт дня при запуске: показываем один раз в день, при первом открытии.
   const [factSplash, setFactSplash] = useState(null);
   useEffect(() => {
     if (!settings) return; // не поверх экрана настройки
-    const todayKey = new Date().toDateString();
-    if (storeGet(FACT_SHOWN_KEY) === todayKey) return;
+    if (storeGet(FACT_SHOWN_KEY) === todayStr) return;
     const dayIdx = Math.floor(Date.now() / 86400000) % FACTS.length; // ротация по дате
     setFactSplash(FACTS[dayIdx]);
     // Важно: НЕ помечаем показанным здесь. Если страницу перезагрузит
     // обновление PWA, факт покажется снова — иначе он «сгорает» непрочитанным.
-  }, [settings]);
+  }, [settings, todayStr]);
 
   const dismissFact = () => {
     storeSet(FACT_SHOWN_KEY, new Date().toDateString()); // прочитан — больше не показываем сегодня
@@ -190,9 +232,8 @@ export default function App() {
   // а не по флагу saved — иначе наутро приложение показывало бы
   // «сохранено», хотя новой записи ещё нет.
   const loggedToday = useMemo(() => {
-    const today = new Date().toDateString();
-    return history.some((r) => new Date(r.date).toDateString() === today);
-  }, [history]);
+    return history.some((r) => new Date(r.date).toDateString() === todayStr);
+  }, [history, todayStr]);
 
   // Classified by the HIGHER of the two values (ESH-style grading).
   const bpBand = useMemo(() => {
@@ -204,17 +245,31 @@ export default function App() {
   }, [sys, dia]);
 
   const insight = useMemo(() => {
-    const sysArr = history.map((r) => r.sys);
-    // Все четыре фактора соревнуются на равных. `expected` — только для того,
-    // чтобы честно отметить неожиданный результат, а НЕ чтобы навязать направление.
-    const cands = [
-      { key: "sleep", label: "сна", expected: -1, arr: history.map((r) => r.sleep) },
-      { key: "steps", label: "шагов", expected: -1, arr: history.map((r) => r.steps) },
-      { key: "stress", label: "стресса", expected: 1, arr: history.map((r) => r.stress) },
-      { key: "salt", label: "солёной еды", expected: 1, arr: history.map((r) => r.salt) },
-    ].map((c) => ({ ...c, r: pearson(c.arr, sysArr) }));
-    cands.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
-    return cands[0];
+    // Кандидаты считаются каждый по своему подмножеству записей, где фактор
+    // заполнен (алкоголь есть не во всех записях). Меньше 5 пар — не участвует.
+    // Также фактор должен реально меняться: если все значения по одну сторону
+    // от середины (например, почти всегда «нет алкоголя»), сравнивать не с чем.
+    const defs = [
+      { key: "sleep", label: "сна", expected: -1 },
+      { key: "steps", label: "шагов", expected: -1 },
+      { key: "stress", label: "стресса", expected: 1 },
+      { key: "salt", label: "солёной еды", expected: 1 },
+      { key: "alcohol", label: "алкоголя", expected: 1 },
+    ];
+    const cands = defs.map((c) => {
+      const rows = history.filter((r) => r[c.key] != null);
+      if (rows.length < 5) return { ...c, r: 0, usable: false };
+      const vals = rows.map((r) => r[c.key]);
+      const mid = (Math.min(...vals) + Math.max(...vals)) / 2;
+      const hasHi = vals.some((v) => v >= mid && v !== Math.min(...vals));
+      const hasLo = vals.some((v) => v < mid);
+      if (!hasHi || !hasLo) return { ...c, r: 0, usable: false }; // нет двух групп для сравнения
+      return { ...c, r: pearson(vals, rows.map((r) => r.sys)), usable: true };
+    });
+    const usable = cands.filter((c) => c.usable);
+    if (usable.length === 0) return null; // пока не с чем работать
+    usable.sort((a, b) => Math.abs(b.r) - Math.abs(a.r));
+    return usable[0];
   }, [history]);
 
   const daysLogged = history.length;
@@ -229,7 +284,10 @@ export default function App() {
     const windowDays = Math.min(14, Math.floor((now - first) / 86400000) + 1);
     const count = history.filter((r) => now - new Date(r.date).getTime() < windowDays * 86400000).length;
     return { count: Math.min(count, windowDays), windowDays };
-  }, [history]);
+  }, [history, todayStr]);
+
+  // Карточка подтверждения не должна переживать смену вкладки или дня.
+  useEffect(() => { setAskUpdate(false); }, [tab, todayStr]);
 
   // До 14 дней прогресс ведёт к первой закономерности, после — к полной картине.
   const INSIGHT_GATE = 14;
@@ -241,10 +299,13 @@ export default function App() {
   const fact = FACTS[daysLogged % FACTS.length];
 
   const saveEntry = () => {
-    const todayStr = new Date().toDateString();
-    const entry = { date: new Date().toISOString(), sys, dia, ...factors, taken: medTaken };
+    const nowStr = new Date().toDateString();
+    const entry = {
+      date: new Date().toISOString(), sys, dia, taken: medTaken,
+      ...Object.fromEntries(activeFactors.map((f) => [f.key, factors[f.key]])),
+    };
     // Одна запись в день: повторное сохранение обновляет сегодняшнюю.
-    setHistory((h) => [...h.filter((r) => new Date(r.date).toDateString() !== todayStr), entry]);
+    setHistory((h) => [...h.filter((r) => new Date(r.date).toDateString() !== nowStr), entry]);
     setSaved(true);
     setTimeout(() => setTab("insight"), 600);
     setTimeout(() => setSaved(false), 2000); // «Сохранено» — короткое подтверждение, не постоянное состояние
@@ -252,7 +313,13 @@ export default function App() {
 
   // First run: pick the daily reading time before anything else.
   if (!settings) {
-    return <Setup onDone={(time) => setSettings({ time, reminderOn: true })} />;
+    return <Setup mode="full" onDone={({ time, profile }) => setSettings({ time, reminderOn: true, profile })} />;
+  }
+  // Существующий пользователь заполняет профиль отдельным мягким шагом.
+  if (showProfileFlow) {
+    return <Setup mode="profile"
+      onDone={(profile) => { setSettings((s) => ({ ...s, profile })); setShowProfileFlow(false); }}
+      onCancel={() => { setShowProfileFlow(false); setProfilePromptHidden(true); }} />;
   }
 
   // Утреннее измерение → вопросы про вчерашний день и прошедшую ночь.
@@ -373,7 +440,7 @@ export default function App() {
 
             <p style={{ color: C.creamDim, fontSize: 12.5, margin: "22px 4px 11px", textTransform: "uppercase", letterSpacing: 0.6 }}>{morning ? "Как прошёл вчерашний день" : "Как прошёл день"}</p>
             <div style={{ display: "grid", gap: 10 }}>
-              {FACTORS.map((f) => (
+              {activeFactors.map((f) => (
                 <FactorRow
                   key={f.key}
                   f={f}
@@ -388,13 +455,45 @@ export default function App() {
               ))}
             </div>
 
-            <button onClick={saveEntry} style={{
-              width: "100%", marginTop: 18, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
-              padding: "18px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
-              display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
-            }}>
-              {saved ? <><Check size={20} strokeWidth={3} /> Сохранено</> : loggedToday ? "Обновить запись" : "Сохранить запись"}
-            </button>
+            {!settings.profile && !profilePromptHidden && (
+              <div style={{ marginTop: 14, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: "14px 16px" }}>
+                <p style={{ color: C.cream, fontSize: 13.5, fontWeight: 600, margin: "0 0 4px" }}>Расскажите немного о себе</p>
+                <p style={{ color: C.creamDim, fontSize: 12, margin: "0 0 12px", lineHeight: 1.5 }}>
+                  Возраст, рост и пара привычек сделают вашу картину точнее. Все поля можно пропустить.
+                </p>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button onClick={() => setShowProfileFlow(true)} style={{ flex: 1, background: C.mint, color: C.bg, border: "none", borderRadius: 11, padding: "11px", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>Заполнить</button>
+                  <button onClick={() => setProfilePromptHidden(true)} style={{ flex: 1, background: "transparent", color: C.creamDim, border: `1px solid ${C.line}`, borderRadius: 11, padding: "11px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>Позже</button>
+                </div>
+              </div>
+            )}
+
+            {askUpdate ? (
+              <div style={{ marginTop: 18, background: C.panel, border: `1px solid ${C.warn}66`, borderRadius: 16, padding: "16px" }}>
+                <p style={{ color: C.cream, fontSize: 14, fontWeight: 600, margin: "0 0 4px" }}>Запись за сегодня уже есть</p>
+                <p style={{ color: C.creamDim, fontSize: 12.5, margin: "0 0 14px", lineHeight: 1.5 }}>
+                  Заменить её текущими значениями — {sys}/{dia}?
+                </p>
+                <div style={{ display: "flex", gap: 10 }}>
+                  <button onClick={() => { setAskUpdate(false); saveEntry(); }} style={{
+                    flex: 1, background: C.mint, color: C.bg, border: "none", borderRadius: 12,
+                    padding: "14px", fontSize: 14.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+                  }}>Да, обновить</button>
+                  <button onClick={() => setAskUpdate(false)} style={{
+                    flex: 1, background: "transparent", color: C.creamDim, border: `1px solid ${C.line}`, borderRadius: 12,
+                    padding: "14px", fontSize: 14.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+                  }}>Отмена</button>
+                </div>
+              </div>
+            ) : (
+              <button onClick={() => { if (loggedToday && !saved) { setAskUpdate(true); } else { saveEntry(); } }} style={{
+                width: "100%", marginTop: 18, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
+                padding: "18px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+                display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+              }}>
+                {saved ? <><Check size={20} strokeWidth={3} /> Сохранено</> : loggedToday ? "Обновить запись" : "Сохранить запись"}
+              </button>
+            )}
             <p style={{ color: C.creamDim, fontSize: 11.5, textAlign: "center", margin: "13px 8px 8px", lineHeight: 1.5 }}>
               Приложение помогает замечать ваши собственные закономерности. Оно не заменяет врача — обсуждайте измерения с лечащим врачом.
             </p>
@@ -463,12 +562,15 @@ function FactSplash({ text, onClose }) {
   );
 }
 
-function Setup({ onDone }) {
-  const [hour, setHour] = useState(8);
-  const [minute, setMinute] = useState(0);
-  const timeStr = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
-  const isMorning = hour < 12;
-
+// Настройка: mode="full" — время + профиль (первый запуск),
+// mode="profile" — только профиль (для тех, кто уже пользуется).
+// Каждый вопрос профиля можно пропустить.
+// Настройка: mode="full" — время + профиль (первый запуск),
+// mode="profile" — только профиль (для тех, кто уже пользуется).
+// Каждый вопрос профиля можно пропустить.
+// Вспомогательные компоненты вынесены на уровень модуля: определённые внутри,
+// они пересоздавались бы при каждом рендере, и поля ввода теряли бы фокус.
+function SetupShell({ title, sub, children }) {
   return (
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", justifyContent: "center", fontFamily: "'Inter', system-ui, sans-serif" }}>
       <style>{`
@@ -480,57 +582,152 @@ function Setup({ onDone }) {
           <Heart size={22} color={C.mint} fill={C.mint} />
           <span style={{ color: C.cream, fontWeight: 700, fontSize: 18 }}>120 app</span>
         </div>
-
-        <h1 style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 27, fontWeight: 500, lineHeight: 1.3, margin: "18px 0 10px" }}>
-          В какое время вам удобно измерять давление каждый день?
-        </h1>
-        <p style={{ color: C.creamDim, fontSize: 14, lineHeight: 1.55, margin: "0 0 26px" }}>
-          Измерения в одно и то же время точнее показывают ваши закономерности. Утро — до лекарств и кофе — обычно лучший выбор, но главное — постоянство.
-        </p>
-
-        {/* Big time display */}
-        <div style={{ background: C.panel, borderRadius: 22, border: `1px solid ${C.line}`, padding: "24px 20px", textAlign: "center" }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, color: C.mintDim, fontSize: 13, marginBottom: 14 }}>
-            {isMorning ? <Sun size={16} /> : <Moon size={16} />}
-            {isMorning ? "Утро" : "Вечер"}
-          </div>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16 }}>
-            <TimeSpin value={hour} onUp={() => setHour((h) => (h + 1) % 24)} onDown={() => setHour((h) => (h + 23) % 24)} pad />
-            <span style={{ fontFamily: "'Fraunces', serif", fontSize: 44, color: C.cream }}>:</span>
-            <TimeSpin value={minute} onUp={() => setMinute((m) => (m + 15) % 60)} onDown={() => setMinute((m) => (m + 45) % 60)} pad />
-          </div>
-        </div>
-
-        {/* Quick presets */}
-        <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
-          {[["08:00", 8, 0], ["09:00", 9, 0], ["20:00", 20, 0]].map(([label, h, m]) => (
-            <button key={label} onClick={() => { setHour(h); setMinute(m); }} style={{
-              flex: 1, padding: "12px 0", borderRadius: 12, cursor: "pointer", fontFamily: "inherit", fontSize: 14, fontWeight: 600,
-              background: timeStr === label ? C.mint : C.panel, color: timeStr === label ? C.bg : C.creamDim,
-              border: `1px solid ${timeStr === label ? C.mint : C.line}`,
-            }}>{label}</button>
-          ))}
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 22, padding: "0 4px" }}>
-          <Bell size={15} color={C.mintDim} />
-          <span style={{ color: C.creamDim, fontSize: 12.5, lineHeight: 1.5 }}>
-            Каждый день в {timeStr} придёт напоминание измерить давление.
-          </span>
-        </div>
-
-        <button onClick={() => onDone(timeStr)} style={{
-          width: "100%", marginTop: 24, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
-          padding: "18px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
-          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
-        }}>
-          Начать <ChevronRight size={18} />
-        </button>
-        <p style={{ color: C.creamDim, fontSize: 11, textAlign: "center", margin: "14px 12px 0", lineHeight: 1.5 }}>
-          Время можно поменять в любой момент. О времени измерения стоит спросить у лечащего врача.
-        </p>
+        <h1 style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 25, fontWeight: 500, lineHeight: 1.3, margin: "18px 0 10px" }}>{title}</h1>
+        {sub && <p style={{ color: C.creamDim, fontSize: 13.5, lineHeight: 1.55, margin: "0 0 22px" }}>{sub}</p>}
+        {children}
       </div>
     </div>
+  );
+}
+
+function SetupChoiceRow({ label, icon: RIcon, value, options, onChange }) {
+  return (
+    <div style={{ background: C.panel, borderRadius: 16, border: `1px solid ${C.line}`, padding: "14px 16px", marginBottom: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 11 }}>
+        {RIcon && <RIcon size={16} color={C.mint} />}
+        <span style={{ color: C.cream, fontSize: 14, fontWeight: 500 }}>{label}</span>
+      </div>
+      <div style={{ display: "flex", gap: 7 }}>
+        {options.map((o) => (
+          <button key={String(o.v)} onClick={() => onChange(value === o.v ? null : o.v)} style={{
+            flex: 1, padding: "12px 4px", borderRadius: 11, border: `1px solid ${value === o.v ? C.mint : C.line}`,
+            cursor: "pointer", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+            background: value === o.v ? C.mint : "transparent", color: value === o.v ? C.bg : C.creamDim,
+          }}>{o.l}</button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SetupNumRow({ label, value, onChange, placeholder, unit, maxLen }) {
+  return (
+    <div style={{ background: C.panel, borderRadius: 16, border: `1px solid ${C.line}`, padding: "14px 16px", marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+      <span style={{ color: C.cream, fontSize: 14, fontWeight: 500 }}>{label}</span>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <input
+          type="text" inputMode="numeric" placeholder={placeholder}
+          value={value ?? ""}
+          onChange={(e) => {
+            const d = e.target.value.replace(/[^\d]/g, "").slice(0, maxLen);
+            onChange(d === "" ? null : parseInt(d, 10));
+          }}
+          style={{ width: 86, textAlign: "center", background: C.bg, border: `1.5px solid ${C.line}`, borderRadius: 10, padding: "10px 6px", color: C.cream, fontSize: 17, fontWeight: 700, fontFamily: "inherit", outline: "none" }}
+        />
+        {unit && <span style={{ color: C.creamDim, fontSize: 13 }}>{unit}</span>}
+      </div>
+    </div>
+  );
+}
+
+function SetupNav({ next, last, mode, onCancel }) {
+  return (
+    <>
+      <button onClick={next} style={{
+        width: "100%", marginTop: 16, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
+        padding: "17px", fontSize: 15.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+      }}>{last ? "Начать" : "Далее"} <ChevronRight size={18} /></button>
+      <button onClick={next} style={{ width: "100%", marginTop: 10, background: "transparent", color: C.creamDim, border: "none", padding: "10px", fontSize: 13, cursor: "pointer", fontFamily: "inherit" }}>
+        Пропустить
+      </button>
+      {mode === "profile" && onCancel && (
+        <button onClick={onCancel} style={{ width: "100%", background: "transparent", color: C.creamDim, border: "none", padding: "4px", fontSize: 12, cursor: "pointer", fontFamily: "inherit", opacity: 0.7 }}>
+          Вернуться к дневнику
+        </button>
+      )}
+    </>
+  );
+}
+
+function Setup({ mode = "full", onDone, onCancel }) {
+  const [step, setStep] = useState(mode === "full" ? 0 : 1);
+  const [hour, setHour] = useState(8);
+  const [minute, setMinute] = useState(0);
+  const [profile, setProfile] = useState({ birthYear: null, gender: null, height: null, weight: null, smoking: null, alcohol: null });
+  const timeStr = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+  const isMorning = hour < 12;
+  const set = (k, v) => setProfile((p) => ({ ...p, [k]: v }));
+
+  const finish = () => onDone(mode === "full" ? { time: timeStr, profile } : profile);
+  const next = () => (step >= 3 ? finish() : setStep(step + 1));
+
+  if (step === 0) return (
+    <SetupShell title="В какое время вам удобно измерять давление каждый день?"
+      sub="Измерения в одно и то же время точнее показывают ваши закономерности. Утро — до лекарств и кофе — обычно лучший выбор, но главное — постоянство.">
+      <div style={{ background: C.panel, borderRadius: 22, border: `1px solid ${C.line}`, padding: "24px 20px", textAlign: "center" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 6, color: C.mintDim, fontSize: 13, marginBottom: 14 }}>
+          {isMorning ? <Sun size={16} /> : <Moon size={16} />}
+          {isMorning ? "Утро" : "Вечер"}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 16 }}>
+          <TimeSpin value={hour} onUp={() => setHour((h) => (h + 1) % 24)} onDown={() => setHour((h) => (h + 23) % 24)} pad />
+          <span style={{ fontFamily: "'Fraunces', serif", fontSize: 44, color: C.cream }}>:</span>
+          <TimeSpin value={minute} onUp={() => setMinute((m) => (m + 15) % 60)} onDown={() => setMinute((m) => (m + 45) % 60)} pad />
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+        {[["08:00", 8, 0], ["09:00", 9, 0], ["20:00", 20, 0]].map(([label, h, m]) => (
+          <button key={label} onClick={() => { setHour(h); setMinute(m); }} style={{
+            flex: 1, padding: "12px 0", borderRadius: 12, cursor: "pointer", fontFamily: "inherit", fontSize: 14, fontWeight: 600,
+            background: timeStr === label ? C.mint : C.panel, color: timeStr === label ? C.bg : C.creamDim,
+            border: `1px solid ${timeStr === label ? C.mint : C.line}`,
+          }}>{label}</button>
+        ))}
+      </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 20, padding: "0 4px" }}>
+        <Bell size={15} color={C.mintDim} />
+        <span style={{ color: C.creamDim, fontSize: 12.5, lineHeight: 1.5 }}>
+          Каждый день в {timeStr} придёт напоминание измерить давление.
+        </span>
+      </div>
+      <button onClick={() => setStep(1)} style={{
+        width: "100%", marginTop: 22, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
+        padding: "18px", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+      }}>Далее <ChevronRight size={18} /></button>
+      <p style={{ color: C.creamDim, fontSize: 11, textAlign: "center", margin: "12px 12px 0", lineHeight: 1.5 }}>
+        Время можно поменять в любой момент. О времени измерения стоит спросить у лечащего врача.
+      </p>
+    </SetupShell>
+  );
+
+  if (step === 1) return (
+    <SetupShell title="Немного о вас" sub="Все поля можно пропустить. Это поможет точнее показать вашу картину и подготовить сводку для врача.">
+      <SetupNumRow label="Год рождения" value={profile.birthYear} onChange={(v) => set("birthYear", v)} placeholder="1962" maxLen={4} />
+      <SetupChoiceRow label="Пол" value={profile.gender} onChange={(v) => set("gender", v)}
+        options={[{ v: "m", l: "Мужчина" }, { v: "f", l: "Женщина" }, { v: "na", l: "Не указывать" }]} />
+      <SetupNav next={next} mode={mode} onCancel={onCancel} />
+    </SetupShell>
+  );
+
+  if (step === 2) return (
+    <SetupShell title="Рост, вес и курение" sub="Эти данные никуда не выводятся в приложении — они только делают сводку для врача полнее.">
+      <SetupNumRow label="Рост" value={profile.height} onChange={(v) => set("height", v)} placeholder="170" unit="см" maxLen={3} />
+      <SetupNumRow label="Вес" value={profile.weight} onChange={(v) => set("weight", v)} placeholder="78" unit="кг" maxLen={3} />
+      <SetupChoiceRow label="Курение" value={profile.smoking} onChange={(v) => set("smoking", v)}
+        options={[{ v: "yes", l: "Курю" }, { v: "no", l: "Не курю" }, { v: "quit", l: "Бросил(а)" }]} />
+      <SetupNav next={next} mode={mode} onCancel={onCancel} />
+    </SetupShell>
+  );
+
+  return (
+    <SetupShell title="Употребляете ли вы алкоголь?"
+      sub="Алкоголь заметно влияет на давление. Если ответите «да», в дневнике появится короткий вопрос о нём — это поможет увидеть связь.">
+      <SetupChoiceRow label="Алкоголь" icon={Wine} value={profile.alcohol} onChange={(v) => set("alcohol", v)}
+        options={[{ v: "yes", l: "Да" }, { v: "no", l: "Нет" }, { v: "na", l: "Не указывать" }]} />
+      <SetupNav next={next} last mode={mode} onCancel={onCancel} />
+    </SetupShell>
   );
 }
 
@@ -569,38 +766,37 @@ function BigStepper({ label, value, setValue, min, max, step }) {
   return (
     <div style={{ marginBottom: 12 }}>
       <span style={{ color: C.creamDim, fontSize: 13, display: "block", marginBottom: 7 }}>{label}</span>
-      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-        <RoundBtn ariaLabel="Уменьшить" onClick={() => setValue((v) => Math.max(min, v - step))}><Minus size={20} color={C.cream} /></RoundBtn>
-
-        {editing ? (
-          <input
-            ref={inputRef}
-            type="text"
-            inputMode="numeric"
-            value={draft}
-            onChange={(e) => setDraft(e.target.value.replace(/[^\d]/g, ""))}
-            onBlur={commit}
-            onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
-            style={{
-              flex: 1, textAlign: "center", background: C.bg, borderRadius: 12, padding: "10px 0",
-              color: C.cream, fontSize: 22, fontWeight: 700, fontFamily: "inherit",
-              border: `2px solid ${C.mint}`, outline: "none", minWidth: 0,
-            }}
-          />
-        ) : (
-          <button
-            onClick={beginEdit}
-            aria-label={`${label}: ${value}. Нажмите, чтобы ввести число`}
-            style={{
-              flex: 1, textAlign: "center", background: C.bg, borderRadius: 12, padding: "10px 0",
-              color: C.cream, fontSize: 22, fontWeight: 700, fontFamily: "inherit",
-              border: `1px dashed ${C.line}`, cursor: "pointer",
-            }}
-          >{value}</button>
-        )}
-
-        <RoundBtn ariaLabel="Увеличить" onClick={() => setValue((v) => Math.min(max, v + step))}><Plus size={20} color={C.cream} /></RoundBtn>
-      </div>
+      {editing ? (
+        <input
+          ref={inputRef}
+          type="text"
+          inputMode="numeric"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value.replace(/[^\d]/g, ""))}
+          onBlur={commit}
+          onKeyDown={(e) => { if (e.key === "Enter") commit(); if (e.key === "Escape") setEditing(false); }}
+          style={{
+            width: "100%", boxSizing: "border-box", textAlign: "center", background: C.bg, borderRadius: 12,
+            padding: "14px 0", color: C.cream, fontSize: 26, fontWeight: 700, fontFamily: "inherit",
+            border: `2px solid ${C.mint}`, outline: "none",
+          }}
+        />
+      ) : (
+        <button
+          onClick={beginEdit}
+          aria-label={`${label}: ${value}. Нажмите, чтобы ввести число`}
+          style={{
+            width: "100%", textAlign: "center", background: C.bg, borderRadius: 12, padding: "14px 0",
+            color: C.cream, fontSize: 26, fontWeight: 700, fontFamily: "inherit",
+            border: `1.5px solid ${C.line}`, cursor: "pointer", position: "relative",
+          }}
+        >
+          {value}
+          <span style={{ position: "absolute", right: 14, top: "50%", transform: "translateY(-50%)", color: C.creamDim, fontSize: 11, fontWeight: 500, opacity: 0.8 }}>
+            изменить
+          </span>
+        </button>
+      )}
     </div>
   );
 }
@@ -664,6 +860,23 @@ function FactorRow({ f, morning, value, setValue }) {
     if (editing && inputRef.current) { inputRef.current.focus(); inputRef.current.select(); }
   }, [editing]);
 
+  if (f.type === "choice") {
+    return (
+      <div style={{ background: C.panel, borderRadius: 16, padding: "14px 16px", border: `1px solid ${C.line}` }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 9, marginBottom: 12 }}>
+          <Icon size={17} color={C.mint} /><span style={{ color: C.cream, fontSize: 14.5, fontWeight: 500 }}>{label}</span>
+        </div>
+        <div style={{ display: "flex", gap: 7 }}>
+          {f.options.map((o) => (
+            <button key={o.v} onClick={() => setValue(o.v)} style={{
+              flex: 1, padding: "13px 0", borderRadius: 11, border: "none", cursor: "pointer", fontFamily: "inherit",
+              fontSize: 13.5, fontWeight: 700, background: value === o.v ? C.mint : C.bg, color: value === o.v ? C.bg : C.creamDim,
+            }}>{o.l}</button>
+          ))}
+        </div>
+      </div>
+    );
+  }
   if (f.type === "scale") {
     return (
       <div style={{ background: C.panel, borderRadius: 16, padding: "14px 16px", border: `1px solid ${C.line}` }}>
@@ -873,8 +1086,26 @@ function InsightView({ history, insight, daysLogged }) {
     );
   }
 
+  // 14+ дней, но ни один фактор пока не менялся достаточно, чтобы сравнивать.
+  if (!insight) {
+    return (
+      <div style={{ padding: "12px 18px 0" }}>
+        <div style={{ background: `linear-gradient(160deg, ${C.panelSoft}, ${C.panel})`, borderRadius: 22, padding: "26px 20px", border: `1px solid ${C.mintDim}55`, textAlign: "center" }}>
+          <Sparkles size={22} color={C.mint} style={{ marginBottom: 10 }} />
+          <p style={{ fontFamily: "'Fraunces', serif", color: C.cream, fontSize: 21, fontWeight: 500, lineHeight: 1.35, margin: "0 0 8px" }}>
+            Пока картина ровная
+          </p>
+          <p style={{ color: C.creamDim, fontSize: 13.5, margin: 0, lineHeight: 1.6 }}>
+            Ваши привычки день ото дня почти не менялись, поэтому связей пока не видно. Со временем, когда дни станут разнообразнее, закономерности проявятся.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   const factorKey = insight.key;
-  const pts = history.map((r) => ({ x: r[factorKey], y: r.sys }));
+  // Для необязательных факторов (алкоголь) берём только записи, где он заполнен.
+  const pts = history.filter((r) => r[factorKey] != null).map((r) => ({ x: r[factorKey], y: r.sys }));
   const xs = pts.map((p) => p.x), ys = pts.map((p) => p.y);
   const xMin = Math.min(...xs), xMax = Math.max(...xs);
   const yMin = Math.min(...ys) - 4, yMax = Math.max(...ys) + 4;
@@ -884,12 +1115,15 @@ function InsightView({ history, insight, daysLogged }) {
 
   const strength = Math.abs(insight.r);
   const strengthLabel = strength > 0.5 ? "чёткая закономерность" : strength > 0.3 ? "первая закономерность" : "слабая связь";
-  const mid = (xMin + xMax) / 2;
-  const hi = ys.filter((_, i) => xs[i] >= mid);
-  const lo = ys.filter((_, i) => xs[i] < mid);
+  const xLo = Math.min(...xs);
+  const mid = (xLo + Math.max(...xs)) / 2;
+  // «Высокая» группа — строго выше минимума и не ниже середины, как в отборе факторов.
+  const hi = ys.filter((_, i) => xs[i] >= mid && xs[i] !== xLo);
+  const lo = ys.filter((_, i) => xs[i] < mid || xs[i] === xLo);
   const avgHi = hi.length ? Math.round(hi.reduce((a, b) => a + b, 0) / hi.length) : 0;
   const avgLo = lo.length ? Math.round(lo.reduce((a, b) => a + b, 0) / lo.length) : 0;
-  const gap = Math.abs(avgHi - avgLo);
+  // Обе группы непусты (гарантировано отбором usable), но на всякий случай:
+  const gap = hi.length && lo.length ? Math.abs(avgHi - avgLo) : 0;
 
   // Направление берём ИЗ ДАННЫХ, а не из ожиданий.
   const higherOnMore = avgHi > avgLo;           // больше фактора → давление выше?
@@ -905,6 +1139,7 @@ function InsightView({ history, insight, daysLogged }) {
     steps: { more: "В дни, когда вы больше ходили", less: "в дни, когда вы ходили меньше" },
     stress: { more: "В более напряжённые дни", less: "в спокойные дни" },
     salt: { more: "В дни с солёной едой", less: "в дни с лёгкой едой" },
+    alcohol: { more: "В дни с алкоголем", less: "в дни без алкоголя" },
   }[factorKey];
 
   // Подсказка следует за данными. При неожиданном направлении — не советуем
@@ -914,6 +1149,7 @@ function InsightView({ history, insight, daysLogged }) {
     steps: "Похоже, ходьба вам заметно помогает. Даже небольшая ежедневная прогулка — хороший шаг.",
     stress: "В напряжённые дни попробуйте несколько минут спокойствия перед сном.",
     salt: "Немного меньше соли несколько дней в неделю — маленький и выполнимый шаг.",
+    alcohol: "Похоже, алкоголь заметно отражается на ваших цифрах. Пара безалкогольных дней подряд — хороший способ это проверить.",
   }[factorKey];
 
   return (
