@@ -4,6 +4,7 @@ import {
   Check, Sparkles, TrendingDown, Info, Plus, Minus, Lightbulb,
   Clock, Bell, Sun, Wine
 } from "lucide-react";
+import { pushEntry, pullEntries, pushAll, pushSettings, dayKeyOf } from "./supabase";
 
 // ---- Design tokens -----------------------------------------------------
 const C = {
@@ -191,6 +192,7 @@ export default function App() {
   const [askUpdate, setAskUpdate] = useState(false);
   const [showProfileFlow, setShowProfileFlow] = useState(false);
   const [profilePromptHidden, setProfilePromptHidden] = useState(false);
+  const [editDay, setEditDay] = useState(null); // { dateISO, entry|null }
   const [settings, setSettings] = useState(() => loadSettings());
 
   // Факторы, которые реально показываем: алкоголь — только для тех, кто пьёт.
@@ -210,6 +212,33 @@ export default function App() {
     const iv = setInterval(upd, 60000);
     document.addEventListener("visibilitychange", upd);
     return () => { clearInterval(iv); document.removeEventListener("visibilitychange", upd); };
+  }, []);
+
+  // Синхронизация при запуске: сервер — источник истины по дням, но дни,
+  // которых на сервере нет (сохранённые офлайн), доталкиваем наверх.
+  useEffect(() => {
+    (async () => {
+      const remote = await pullEntries();
+      if (remote === null) return; // офлайн — живём локально
+      const local = initialRef.current.entries;
+      if (remote.length === 0) {
+        if (local.length > 0) pushAll(local); // первая миграция локальной истории
+        return;
+      }
+      const remoteMap = new Map(remote.map((r) => [r.day_key, r]));
+      const localOnly = local.filter((e) => !remoteMap.has(dayKeyOf(e.date)));
+      if (localOnly.length > 0) pushAll(localOnly);
+      const merged = [
+        ...remote.map((r) => ({
+          date: r.date, sys: r.sys, dia: r.dia,
+          sleep: r.sleep != null ? Number(r.sleep) : null,
+          steps: r.steps, stress: r.stress, salt: r.salt,
+          alcohol: r.alcohol, taken: r.taken,
+        })),
+        ...localOnly,
+      ].sort((a, b) => new Date(a.date) - new Date(b.date));
+      setHistory(merged);
+    })();
   }, []);
 
   // Факт дня при запуске: показываем один раз в день, при первом открытии.
@@ -306,6 +335,7 @@ export default function App() {
     };
     // Одна запись в день: повторное сохранение обновляет сегодняшнюю.
     setHistory((h) => [...h.filter((r) => new Date(r.date).toDateString() !== nowStr), entry]);
+    pushEntry(entry); // в облако, не блокируя сохранение
     setSaved(true);
     setTimeout(() => setTab("insight"), 600);
     setTimeout(() => setSaved(false), 2000); // «Сохранено» — короткое подтверждение, не постоянное состояние
@@ -313,17 +343,41 @@ export default function App() {
 
   // First run: pick the daily reading time before anything else.
   if (!settings) {
-    return <Setup mode="full" onDone={({ time, profile }) => setSettings({ time, reminderOn: true, profile })} />;
+    return <Setup mode="full" onDone={({ time, profile }) => { setSettings({ time, reminderOn: true, profile }); pushSettings(time, profile); }} />;
   }
   // Существующий пользователь заполняет профиль отдельным мягким шагом.
   if (showProfileFlow) {
     return <Setup mode="profile"
-      onDone={(profile) => { setSettings((s) => ({ ...s, profile })); setShowProfileFlow(false); }}
+      onDone={(profile) => { setSettings((s) => ({ ...s, profile })); pushSettings(settings.time, profile); setShowProfileFlow(false); }}
       onCancel={() => { setShowProfileFlow(false); setProfilePromptHidden(true); }} />;
   }
 
   // Утреннее измерение → вопросы про вчерашний день и прошедшую ночь.
   const morning = parseInt(settings.time.split(":")[0], 10) < 12;
+
+  // Редактирование прошлого дня или добавление пропущенного (последние 7 дней).
+  if (editDay) {
+    return <EditDay
+      day={editDay}
+      activeFactors={activeFactors}
+      onCancel={() => setEditDay(null)}
+      onSave={(entry) => {
+        const ds = new Date(entry.date).toDateString();
+        setHistory((h) => {
+          const next = [...h.filter((r) => new Date(r.date).toDateString() !== ds), entry];
+          next.sort((a, b) => new Date(a.date) - new Date(b.date)); // порядок важен для графика и серии
+          return next;
+        });
+        pushEntry(entry); // в облако тем же путём, что и обычное сохранение
+        // Если правили сегодняшний день — обновляем и форму на «Сегодня».
+        if (ds === todayStr) {
+          setSys(entry.sys); setDia(entry.dia); setMedTaken(!!entry.taken);
+          setFactors((s) => ({ ...s, ...Object.fromEntries(activeFactors.map((f) => [f.key, entry[f.key] != null ? entry[f.key] : s[f.key]])) }));
+        }
+        setEditDay(null);
+      }}
+    />;
+  }
 
   return (
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", justifyContent: "center", fontFamily: "'Inter', system-ui, sans-serif" }}>
@@ -500,7 +554,7 @@ export default function App() {
           </div>
         )}
 
-        {tab === "trend" && <TrendView history={history} fact={fact} />}
+        {tab === "trend" && <TrendView history={history} fact={fact} onPick={(dateISO, entry) => setEditDay({ dateISO, entry })} />}
         {tab === "insight" && <InsightView history={history} insight={insight} daysLogged={daysLogged} />}
       </div>
     </div>
@@ -697,7 +751,7 @@ function Setup({ mode = "full", onDone, onCancel }) {
         display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
       }}>Далее <ChevronRight size={18} /></button>
       <p style={{ color: C.creamDim, fontSize: 11, textAlign: "center", margin: "12px 12px 0", lineHeight: 1.5 }}>
-        Время можно поменять в любой момент. О времени измерения стоит спросить у лечащего врача.
+        Время можно поменять в любой момент. Записи сохраняются в семейном облаке и видны тому, кто настроил приложение.
       </p>
     </SetupShell>
   );
@@ -941,39 +995,126 @@ function FactorRow({ f, morning, value, setValue }) {
   );
 }
 
-function TrendView({ history, fact }) {
-  const rows = history.slice(-14);
+// Редактор одного дня: исправить существующую запись или заполнить пропущенную.
+// Использует те же элементы управления, что и «Сегодня».
+function EditDay({ day, activeFactors, onSave, onCancel }) {
+  const { dateISO, entry } = day;
+  const isNew = !entry;
+  const [sys, setSys] = useState(entry ? entry.sys : 128);
+  const [dia, setDia] = useState(entry ? entry.dia : 82);
+  const [taken, setTaken] = useState(entry ? !!entry.taken : true);
+  const [factors, setFactors] = useState(() =>
+    Object.fromEntries(activeFactors.map((f) => [f.key, entry && entry[f.key] != null ? entry[f.key] : f.def]))
+  );
+  const d = new Date(dateISO);
+  const title = (isNew ? "Добавить запись за " : "Запись за ") + d.toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
 
-  if (rows.length < 2) {
-    return (
-      <div style={{ padding: "12px 18px 0" }}>
-        <div style={{ background: C.panel, borderRadius: 20, padding: "28px 20px", border: `1px solid ${C.line}`, textAlign: "center" }}>
-          <p style={{ color: C.cream, fontSize: 15, fontWeight: 600, margin: "0 0 6px" }}>График появится после второй записи</p>
-          <p style={{ color: C.creamDim, fontSize: 13, margin: 0, lineHeight: 1.55 }}>
-            Сохраняйте измерение каждый день — и здесь будет видно, как меняется ваше давление.
-          </p>
-        </div>
-        <div style={{ marginTop: 12, background: `${C.mint}12`, border: `1px solid ${C.mintDim}44`, borderRadius: 16, padding: "15px 16px", display: "flex", gap: 12 }}>
-          <div style={{ minWidth: 34, height: 34, borderRadius: 10, background: `${C.mint}22`, display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "flex-start" }}>
-            <Lightbulb size={18} color={C.mint} />
-          </div>
-          <div>
-            <p style={{ color: C.mint, fontSize: 11.5, fontWeight: 700, margin: "0 0 4px", textTransform: "uppercase", letterSpacing: 0.5 }}>Полезно знать</p>
-            <p style={{ color: C.cream, fontSize: 13, margin: 0, lineHeight: 1.55 }}>{fact}</p>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  const max = Math.max(...rows.map((r) => r.sys)) + 6;
-  const min = Math.min(...rows.map((r) => r.dia)) - 6;
-  const H = 150, W = 340, step = W / (rows.length - 1);
-  const y = (v) => H - ((v - min) / (max - min)) * H;
-  const path = (key) => rows.map((r, i) => `${i === 0 ? "M" : "L"} ${i * step} ${y(r[key])}`).join(" ");
+  const save = () => onSave({
+    date: entry ? entry.date : dateISO, // у существующей записи сохраняем исходное время
+    sys, dia, taken,
+    ...Object.fromEntries(activeFactors.map((f) => [f.key, factors[f.key]])),
+  });
 
   return (
-    <div style={{ padding: "12px 18px 0" }}>
+    <SetupShell
+      title={title}
+      sub={isNew
+        ? "Заполните по памяти — примерные значения лучше, чем пропуск."
+        : "Исправьте значения и сохраните."}
+    >
+      <div style={{ background: C.panel, borderRadius: 20, padding: "20px", border: `1px solid ${C.line}`, marginBottom: 10 }}>
+        <BigStepper label="Верхнее (систолическое)" value={sys} setValue={setSys} min={80} max={200} step={1} />
+        <BigStepper label="Нижнее (диастолическое)" value={dia} setValue={setDia} min={40} max={130} step={1} />
+      </div>
+
+      <button onClick={() => setTaken((m) => !m)} style={{
+        width: "100%", background: C.panel, border: `1px solid ${taken ? C.mintDim : C.line}`,
+        borderRadius: 16, padding: "14px 16px", display: "flex", alignItems: "center", justifyContent: "space-between",
+        cursor: "pointer", fontFamily: "inherit", marginBottom: 10,
+      }}>
+        <span style={{ display: "flex", alignItems: "center", gap: 11 }}>
+          <Pill size={17} color={taken ? C.mint : C.creamDim} />
+          <span style={{ color: C.cream, fontSize: 14, fontWeight: 500 }}>Лекарство в этот день</span>
+        </span>
+        <span style={{ width: 26, height: 26, borderRadius: 8, background: taken ? C.mint : "transparent", border: `1px solid ${taken ? C.mint : C.creamDim}`, display: "flex", alignItems: "center", justifyContent: "center" }}>
+          {taken && <Check size={16} color={C.bg} strokeWidth={3} />}
+        </span>
+      </button>
+
+      <div style={{ display: "grid", gap: 10 }}>
+        {activeFactors.map((f) => (
+          <FactorRow
+            key={f.key}
+            f={f}
+            morning={false} /* редактируем конкретную дату — метки без «вчера» */
+            value={factors[f.key]}
+            setValue={(next) => setFactors((s) => ({
+              ...s,
+              [f.key]: typeof next === "function" ? next(s[f.key]) : next,
+            }))}
+          />
+        ))}
+      </div>
+
+      <button onClick={save} style={{
+        width: "100%", marginTop: 16, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
+        padding: "17px", fontSize: 15.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+        display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+      }}>
+        <Check size={18} strokeWidth={3} /> Сохранить
+      </button>
+      <button onClick={onCancel} style={{
+        width: "100%", marginTop: 10, background: "transparent", color: C.creamDim, border: `1px solid ${C.line}`,
+        borderRadius: 14, padding: "13px", fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+      }}>
+        Отмена
+      </button>
+    </SetupShell>
+  );
+}
+
+function TrendView({ history, fact, onPick }) {
+  const rows = history.slice(-14);
+
+  // Последние 7 календарных дней: записи можно исправить, пропуски — заполнить.
+  const dayList = Array.from({ length: 7 }, (_, i) => {
+    const d = new Date(); d.setDate(d.getDate() - i);
+    const ds = d.toDateString();
+    return { d, entry: history.find((r) => new Date(r.date).toDateString() === ds) || null, idx: i };
+  });
+  const dayLabel = (d, idx) =>
+    idx === 0 ? "Сегодня" : idx === 1 ? "Вчера"
+      : d.toLocaleDateString("ru-RU", { weekday: "short", day: "numeric", month: "short" });
+
+  const factCard = (
+    <div style={{ marginTop: 12, background: `${C.mint}12`, border: `1px solid ${C.mintDim}44`, borderRadius: 16, padding: "15px 16px", display: "flex", gap: 12 }}>
+      <div style={{ minWidth: 34, height: 34, borderRadius: 10, background: `${C.mint}22`, display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "flex-start" }}>
+        <Lightbulb size={18} color={C.mint} />
+      </div>
+      <div>
+        <p style={{ color: C.mint, fontSize: 11.5, fontWeight: 700, margin: "0 0 4px", textTransform: "uppercase", letterSpacing: 0.5 }}>Полезно знать</p>
+        <p style={{ color: C.cream, fontSize: 13, margin: 0, lineHeight: 1.55 }}>{fact}</p>
+      </div>
+    </div>
+  );
+
+  let chartBlock;
+  if (rows.length < 2) {
+    chartBlock = (
+      <div style={{ background: C.panel, borderRadius: 20, padding: "28px 20px", border: `1px solid ${C.line}`, textAlign: "center" }}>
+        <p style={{ color: C.cream, fontSize: 15, fontWeight: 600, margin: "0 0 6px" }}>График появится после второй записи</p>
+        <p style={{ color: C.creamDim, fontSize: 13, margin: 0, lineHeight: 1.55 }}>
+          Сохраняйте измерение каждый день — и здесь будет видно, как меняется ваше давление.
+        </p>
+      </div>
+    );
+  } else {
+    const max = Math.max(...rows.map((r) => r.sys)) + 6;
+    const min = Math.min(...rows.map((r) => r.dia)) - 6;
+    const H = 150, W = 340, step = W / (rows.length - 1);
+    const y = (v) => H - ((v - min) / (max - min)) * H;
+    const path = (key) => rows.map((r, i) => `${i === 0 ? "M" : "L"} ${i * step} ${y(r[key])}`).join(" ");
+    chartBlock = (
       <div style={{ background: C.panel, borderRadius: 20, padding: "20px 18px 14px", border: `1px solid ${C.line}` }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
           <span style={{ color: C.cream, fontSize: 15, fontWeight: 600 }}>Последние 14 дней</span>
@@ -991,35 +1132,55 @@ function TrendView({ history, fact }) {
           {rows.map((r, i) => (<g key={i}><circle cx={i * step} cy={y(r.sys)} r={2.8} fill={C.coral} /><circle cx={i * step} cy={y(r.dia)} r={2.8} fill={C.mint} /></g>))}
         </svg>
       </div>
+    );
+  }
 
-      {/* Education woven in — one fact under the readings */}
-      <div style={{ marginTop: 12, background: `${C.mint}12`, border: `1px solid ${C.mintDim}44`, borderRadius: 16, padding: "15px 16px", display: "flex", gap: 12 }}>
-        <div style={{ minWidth: 34, height: 34, borderRadius: 10, background: `${C.mint}22`, display: "flex", alignItems: "center", justifyContent: "center", alignSelf: "flex-start" }}>
-          <Lightbulb size={18} color={C.mint} />
-        </div>
-        <div>
-          <p style={{ color: C.mint, fontSize: 11.5, fontWeight: 700, margin: "0 0 4px", textTransform: "uppercase", letterSpacing: 0.5 }}>Полезно знать</p>
-          <p style={{ color: C.cream, fontSize: 13, margin: 0, lineHeight: 1.55 }}>{fact}</p>
-        </div>
-      </div>
+  return (
+    <div style={{ padding: "12px 18px 0" }}>
+      {chartBlock}
+      {factCard}
 
-      <p style={{ color: C.creamDim, fontSize: 12.5, margin: "22px 4px 11px", textTransform: "uppercase", letterSpacing: 0.6 }}>Недавние записи</p>
-      {history.slice(-6).reverse().map((r, i) => {
-        const d = new Date(r.date);
-        return (
-          <div key={i} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 16px", background: C.panel, borderRadius: 14, marginBottom: 8, border: `1px solid ${C.line}` }}>
-            <div>
-              <span style={{ color: C.cream, fontSize: 15, fontWeight: 700 }}>{r.sys}/{r.dia}</span>
-              <span style={{ color: C.creamDim, fontSize: 12, marginLeft: 8 }}>{d.toLocaleDateString("ru-RU", { day: "numeric", month: "short" })}</span>
-            </div>
-            <div style={{ display: "flex", gap: 13, alignItems: "center" }}>
-              <MiniStat icon={Footprints} v={fmtNum(r.steps)} />
-              <MiniStat icon={Moon} v={`${r.sleep}ч`} />
-              <Pill size={15} color={r.taken ? C.mintDim : "#8A5A55"} />
-            </div>
+      <p style={{ color: C.creamDim, fontSize: 12.5, margin: "22px 4px 4px", textTransform: "uppercase", letterSpacing: 0.6 }}>Последние 7 дней</p>
+      <p style={{ color: C.creamDim, fontSize: 11, margin: "0 4px 10px", opacity: 0.75 }}>Нажмите на запись, чтобы исправить, или добавьте пропущенный день.</p>
+      {dayList.map(({ d, entry, idx }) => entry ? (
+        <button
+          key={idx}
+          onClick={() => onPick(entry.date, entry)}
+          style={{
+            width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+            padding: "14px 16px", background: C.panel, borderRadius: 14, marginBottom: 8,
+            border: `1px solid ${C.line}`, cursor: "pointer", fontFamily: "inherit", textAlign: "left",
+          }}
+        >
+          <div>
+            <span style={{ color: C.cream, fontSize: 15, fontWeight: 700 }}>{entry.sys}/{entry.dia}</span>
+            <span style={{ color: C.creamDim, fontSize: 12, marginLeft: 8 }}>{dayLabel(d, idx)}</span>
           </div>
-        );
-      })}
+          <div style={{ display: "flex", gap: 13, alignItems: "center" }}>
+            {entry.steps != null && <MiniStat icon={Footprints} v={fmtNum(entry.steps)} />}
+            {entry.sleep != null && <MiniStat icon={Moon} v={`${entry.sleep}ч`} />}
+            <Pill size={15} color={entry.taken ? C.mintDim : "#8A5A55"} />
+            <ChevronRight size={16} color={C.creamDim} />
+          </div>
+        </button>
+      ) : (
+        <button
+          key={idx}
+          onClick={() => onPick(new Date(d.getFullYear(), d.getMonth(), d.getDate(), 12, 0, 0).toISOString(), null)}
+          style={{
+            width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between",
+            padding: "14px 16px", background: "transparent", borderRadius: 14, marginBottom: 8,
+            border: `1px dashed ${C.line}`, cursor: "pointer", fontFamily: "inherit", textAlign: "left",
+          }}
+        >
+          <span style={{ color: C.creamDim, fontSize: 13 }}>
+            {dayLabel(d, idx)} — нет записи
+          </span>
+          <span style={{ display: "flex", alignItems: "center", gap: 4, color: C.mint, fontSize: 13, fontWeight: 600 }}>
+            <Plus size={15} /> Добавить
+          </span>
+        </button>
+      ))}
     </div>
   );
 }
