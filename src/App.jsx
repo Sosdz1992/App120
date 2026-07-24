@@ -4,7 +4,7 @@ import {
   Check, Sparkles, TrendingDown, Info, Plus, Minus, Lightbulb,
   Clock, Bell, Sun, Wine
 } from "lucide-react";
-import { pushEntry, pullEntries, pushAll, pushSettings, dayKeyOf } from "./supabase";
+import { supabase, pushEntry, pullEntries, pullSettings, pushAll, pushSettings, requestMagicLink, dayKeyOf } from "./supabase";
 
 // ---- Design tokens -----------------------------------------------------
 const C = {
@@ -42,6 +42,8 @@ function persist(entries) {
 
 const SETTINGS_KEY = "davlenie_settings_v1";
 const FACT_SHOWN_KEY = "davlenie_fact_shown_v1";
+const NAME_KEY = "davlenie_name_v1"; // имя для семейной сводки; переживает редирект входа
+const OWNER_KEY = "davlenie_owner_v1"; // чей аккаунт владеет локальным кэшем
 function loadSettings() {
   try {
     const raw = storeGet(SETTINGS_KEY);
@@ -49,7 +51,7 @@ function loadSettings() {
   } catch { return null; }
 }
 function persistSettings(s) {
-  try { storeSet(SETTINGS_KEY, JSON.stringify(s)); } catch { /* no-op */ }
+  try { storeSet(SETTINGS_KEY, s == null ? "" : JSON.stringify(s)); } catch { /* no-op */ }
 }
 
 // ---- Interesting facts about hypertension (rotate) ---------------------
@@ -214,10 +216,66 @@ export default function App() {
     return () => { clearInterval(iv); document.removeEventListener("visibilitychange", upd); };
   }, []);
 
-  // Синхронизация при запуске: сервер — источник истины по дням, но дни,
-  // которых на сервере нет (сохранённые офлайн), доталкиваем наверх.
+  // Аккаунт: следим за сессией. Анонимные сессии со старой версии считаем
+  // «не вошёл» — человек один раз входит по ссылке из письма и получает
+  // постоянный аккаунт, общий для всех его устройств.
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authUser, setAuthUser] = useState(null);
   useEffect(() => {
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setAuthUser(session?.user ?? null);
+      setAuthChecked(true);
+    });
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
+      setAuthUser(session?.user ?? null);
+    });
+    return () => sub.subscription.unsubscribe();
+  }, []);
+  const authedId = authUser && !authUser.is_anonymous ? authUser.id : null;
+
+  // Имя для шапки и семейной сводки + открыта ли карточка аккаунта.
+  const [userName, setUserName] = useState(() => storeGet(NAME_KEY) || "");
+  const [accountOpen, setAccountOpen] = useState(false);
+
+  // Синхронизация: запускается, когда человек вошёл. Сервер — источник истины
+  // по дням, но дни, которых на сервере нет (офлайн), доталкиваем наверх.
+  // Здесь же — отправка настроек и имени (у старых устройств они были только локально).
+  useEffect(() => {
+    if (!authedId) return;
     (async () => {
+      // Локальный кэш принадлежит конкретному аккаунту. Если на этом устройстве
+      // раньше был другой человек — его записи, имя и настройки НЕ считаем
+      // своими: не выгружаем и убираем.
+      const owner = storeGet(OWNER_KEY);
+      const foreign = owner && owner !== authedId;
+      if (foreign) {
+        persist([]);
+        setHistory([]);
+        initialRef.current.entries = [];
+        initialRef.current.today = null;
+        storeSet(NAME_KEY, "");
+        setUserName("");
+        persistSettings(null);
+        setSettings(null);
+      }
+      storeSet(OWNER_KEY, authedId);
+
+      // Один запрос настроек с сервера: возвращающемуся пользователю
+      // восстанавливаем время и профиль (обещание «вернутся при входе»),
+      // и подтягиваем имя, если локально его нет.
+      const rs = await pullSettings();
+      let s = foreign ? null : loadSettings();
+      if (!s && rs && (rs.time || rs.profile)) {
+        s = { time: rs.time || "08:00", reminderOn: true, profile: rs.profile ?? null };
+        persistSettings(s);
+        setSettings(s);
+      }
+      if (!storeGet(NAME_KEY) && rs?.name) {
+        storeSet(NAME_KEY, rs.name);
+        setUserName(rs.name);
+      }
+      // Настройки и имя — на сервер (patch: пустое ничего не затирает).
+      pushSettings(s?.time, s?.profile, storeGet(NAME_KEY));
       const remote = await pullEntries();
       if (remote === null) return; // офлайн — живём локально
       const local = initialRef.current.entries;
@@ -239,7 +297,7 @@ export default function App() {
       ].sort((a, b) => new Date(a.date) - new Date(b.date));
       setHistory(merged);
     })();
-  }, []);
+  }, [authedId]);
 
   // Факт дня при запуске: показываем один раз в день, при первом открытии.
   const [factSplash, setFactSplash] = useState(null);
@@ -341,14 +399,22 @@ export default function App() {
     setTimeout(() => setSaved(false), 2000); // «Сохранено» — короткое подтверждение, не постоянное состояние
   };
 
+  // Пока не знаем состояние сессии — ничего не мигаем на экране.
+  if (!authChecked) {
+    return <div style={{ minHeight: "100vh", background: C.bg }} />;
+  }
+  // Нет постоянного аккаунта → один раз входим по ссылке из письма.
+  if (!authedId) {
+    return <SignIn />;
+  }
   // First run: pick the daily reading time before anything else.
   if (!settings) {
-    return <Setup mode="full" onDone={({ time, profile }) => { setSettings({ time, reminderOn: true, profile }); pushSettings(time, profile); }} />;
+    return <Setup mode="full" onDone={({ time, profile }) => { setSettings({ time, reminderOn: true, profile }); pushSettings(time, profile, storeGet(NAME_KEY)); }} />;
   }
   // Существующий пользователь заполняет профиль отдельным мягким шагом.
   if (showProfileFlow) {
     return <Setup mode="profile"
-      onDone={(profile) => { setSettings((s) => ({ ...s, profile })); pushSettings(settings.time, profile); setShowProfileFlow(false); }}
+      onDone={(profile) => { setSettings((s) => ({ ...s, profile })); pushSettings(settings.time, profile, storeGet(NAME_KEY)); setShowProfileFlow(false); }}
       onCancel={() => { setShowProfileFlow(false); setProfilePromptHidden(true); }} />;
   }
 
@@ -390,6 +456,36 @@ export default function App() {
       `}</style>
 
       {factSplash && <FactSplash text={factSplash} onClose={dismissFact} />}
+      {accountOpen && (
+        <AccountCard
+          name={userName}
+          email={authUser?.email || ""}
+          time={settings.time}
+          onRename={(v) => {
+            const clean = v.trim();
+            if (!clean) return;
+            storeSet(NAME_KEY, clean);
+            setUserName(clean);
+            pushSettings(null, null, clean); // patch: обновит только имя
+          }}
+          onSignOut={async () => {
+            setAccountOpen(false);
+            try { await supabase.auth.signOut(); } catch { /* сеть */ }
+            // Убираем локальные следы: в облаке всё сохранено и вернётся при входе.
+            // Иначе следующий вошедший на этом телефоне «унаследует» чужой дневник.
+            persist([]);
+            storeSet(NAME_KEY, "");
+            storeSet(OWNER_KEY, "");
+            persistSettings(null);
+            setHistory([]);
+            setUserName("");
+            setSettings(null);
+            initialRef.current.entries = [];
+            initialRef.current.today = null;
+          }}
+          onClose={() => setAccountOpen(false)}
+        />
+      )}
 
       <div className="phone" style={{
         width: 402, minHeight: "100vh", background: C.bg, position: "relative",
@@ -397,9 +493,22 @@ export default function App() {
       }}>
         {/* Header */}
         <div style={{ padding: "26px 24px 6px" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
-            <Heart size={20} color={C.mint} fill={C.mint} />
-            <span style={{ color: C.cream, fontWeight: 700, fontSize: 17 }}>120 app</span>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+              <Heart size={20} color={C.mint} fill={C.mint} />
+              <span style={{ color: C.cream, fontWeight: 700, fontSize: 17 }}>120 app</span>
+            </div>
+            <button
+              onClick={() => setAccountOpen(true)}
+              aria-label={`Ваш аккаунт: ${userName || "без имени"}`}
+              style={{
+                width: 38, height: 38, borderRadius: 99, background: `${C.mint}1E`,
+                border: `1.5px solid ${C.mintDim}66`, color: C.mint, fontSize: 16, fontWeight: 700,
+                cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+            >
+              {(userName.trim()[0] || "•").toUpperCase()}
+            </button>
           </div>
           <p style={{ color: C.creamDim, fontSize: 13.5, margin: "5px 0 0", paddingLeft: 29 }}>
             {daysLogged === 0
@@ -624,6 +733,152 @@ function FactSplash({ text, onClose }) {
 // Каждый вопрос профиля можно пропустить.
 // Вспомогательные компоненты вынесены на уровень модуля: определённые внутри,
 // они пересоздавались бы при каждом рендере, и поля ввода теряли бы фокус.
+// Карточка аккаунта: кто вошёл, почта, время напоминания, смена имени, выход.
+// Открывается по кружку с инициалом в шапке.
+function AccountCard({ name, email, time, onRename, onSignOut, onClose }) {
+  const [editName, setEditName] = useState(name);
+  const [confirmOut, setConfirmOut] = useState(false);
+  const changed = editName.trim() !== name && editName.trim().length > 0;
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, zIndex: 60, background: "rgba(10, 26, 29, 0.82)",
+        display: "flex", alignItems: "center", justifyContent: "center", padding: 20,
+      }}
+    >
+      <div onClick={(e) => e.stopPropagation()} style={{ width: "100%", maxWidth: 350, background: C.panel, border: `1px solid ${C.line}`, borderRadius: 22, padding: "22px 20px" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 13, marginBottom: 18 }}>
+          <div style={{ width: 48, height: 48, borderRadius: 99, background: `${C.mint}1E`, border: `1.5px solid ${C.mintDim}66`, color: C.mint, fontSize: 21, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            {(name.trim()[0] || "•").toUpperCase()}
+          </div>
+          <div style={{ minWidth: 0 }}>
+            <p style={{ color: C.cream, fontSize: 15.5, fontWeight: 700, margin: 0 }}>
+              {name.trim() ? `Вы вошли как: ${name}` : "Вы вошли в аккаунт"}
+            </p>
+            <p style={{ color: C.creamDim, fontSize: 12.5, margin: "3px 0 0", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{email}</p>
+          </div>
+        </div>
+
+        <div style={{ background: C.bg, borderRadius: 14, padding: "13px 14px", marginBottom: 10 }}>
+          <p style={{ color: C.creamDim, fontSize: 11.5, margin: "0 0 7px" }}>Имя в семейной сводке</p>
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="text" value={editName}
+              onChange={(e) => setEditName(e.target.value)}
+              placeholder="Например: Мама"
+              style={{ flex: 1, minWidth: 0, background: C.panel, border: `1.5px solid ${C.line}`, borderRadius: 10, padding: "10px 12px", color: C.cream, fontSize: 14.5, fontFamily: "inherit", outline: "none" }}
+            />
+            {changed && (
+              <button onClick={() => onRename(editName)} style={{ background: C.mint, color: C.bg, border: "none", borderRadius: 10, padding: "0 14px", fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>
+                <Check size={17} strokeWidth={3} />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 9, background: C.bg, borderRadius: 14, padding: "13px 14px", marginBottom: 10 }}>
+          <Clock size={15} color={C.mintDim} />
+          <span style={{ color: C.cream, fontSize: 13.5 }}>Напоминание в {time}</span>
+        </div>
+
+        <p style={{ color: C.creamDim, fontSize: 11, margin: "0 2px 14px", lineHeight: 1.55, opacity: 0.85 }}>
+          Записи сохраняются в семейном облаке и видны тому, кто настроил приложение.
+        </p>
+
+        {confirmOut ? (
+          <div style={{ border: `1px solid ${C.warn}66`, borderRadius: 14, padding: "13px 14px" }}>
+            <p style={{ color: C.cream, fontSize: 13.5, fontWeight: 600, margin: "0 0 5px" }}>Выйти из аккаунта?</p>
+            <p style={{ color: C.creamDim, fontSize: 12, margin: "0 0 12px", lineHeight: 1.5 }}>
+              Записи не удалятся — они сохранены в аккаунте и вернутся при следующем входе.
+            </p>
+            <div style={{ display: "flex", gap: 9 }}>
+              <button onClick={onSignOut} style={{ flex: 1, background: "transparent", color: C.warn, border: `1px solid ${C.warn}88`, borderRadius: 11, padding: "11px", fontSize: 13, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>Да, выйти</button>
+              <button onClick={() => setConfirmOut(false)} style={{ flex: 1, background: "transparent", color: C.creamDim, border: `1px solid ${C.line}`, borderRadius: 11, padding: "11px", fontSize: 13, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>Отмена</button>
+            </div>
+          </div>
+        ) : (
+          <div style={{ display: "flex", gap: 9 }}>
+            <button onClick={() => setConfirmOut(true)} style={{ flex: 1, background: "transparent", color: C.creamDim, border: `1px solid ${C.line}`, borderRadius: 12, padding: "13px", fontSize: 13.5, fontWeight: 600, cursor: "pointer", fontFamily: "inherit" }}>Выйти</button>
+            <button onClick={onClose} style={{ flex: 1, background: C.mint, color: C.bg, border: "none", borderRadius: 12, padding: "13px", fontSize: 13.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit" }}>Закрыть</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Вход по ссылке из письма: без паролей. Имя нужно для семейной сводки —
+// чтобы в общих данных было видно, чья это запись.
+function SignIn() {
+  const [name, setName] = useState(() => storeGet(NAME_KEY) || "");
+  const [email, setEmail] = useState("");
+  const [sent, setSent] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const send = async () => {
+    const e = email.trim().toLowerCase();
+    if (!e.includes("@") || e.length < 5) { setErr("Проверьте адрес почты"); return; }
+    setBusy(true); setErr(null);
+    storeSet(NAME_KEY, name.trim()); // переживёт переход по ссылке
+    try { await supabase.auth.signOut(); } catch { /* старая анонимная сессия */ }
+    const problem = await requestMagicLink(e);
+    setBusy(false);
+    if (problem) { setErr("Не получилось отправить письмо. Проверьте адрес и попробуйте ещё раз."); return; }
+    setSent(true);
+  };
+
+  if (sent) return (
+    <SetupShell title="Письмо отправлено"
+      sub={`Откройте почту ${email.trim()} на этом устройстве и нажмите в письме кнопку входа. После этого вернитесь в приложение.`}>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 16, padding: "15px 16px" }}>
+        <p style={{ color: C.creamDim, fontSize: 12.5, margin: 0, lineHeight: 1.6 }}>
+          Письмо не пришло за пару минут? Загляните в папку «Спам».
+        </p>
+      </div>
+      <button onClick={() => setSent(false)} style={{
+        width: "100%", marginTop: 14, background: "transparent", color: C.creamDim,
+        border: `1px solid ${C.line}`, borderRadius: 14, padding: "13px", fontSize: 13.5,
+        fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+      }}>Изменить адрес</button>
+    </SetupShell>
+  );
+
+  return (
+    <SetupShell title="Ваш аккаунт"
+      sub="Один раз войдите по ссылке из письма — без пароля. Так записи не потеряются при смене телефона и будут видны с любого вашего устройства.">
+      <div style={{ background: C.panel, borderRadius: 16, border: `1px solid ${C.line}`, padding: "14px 16px", marginBottom: 10 }}>
+        <p style={{ color: C.cream, fontSize: 14, fontWeight: 500, margin: "0 0 8px" }}>Как вас зовут?</p>
+        <input
+          type="text" value={name} placeholder="Например: Мама"
+          onChange={(e) => setName(e.target.value)}
+          style={{ width: "100%", boxSizing: "border-box", background: C.bg, border: `1.5px solid ${C.line}`, borderRadius: 10, padding: "12px", color: C.cream, fontSize: 15, fontFamily: "inherit", outline: "none" }}
+        />
+        <p style={{ color: C.creamDim, fontSize: 11, margin: "7px 0 0", opacity: 0.8 }}>Имя видно в семейной сводке.</p>
+      </div>
+      <div style={{ background: C.panel, borderRadius: 16, border: `1px solid ${C.line}`, padding: "14px 16px" }}>
+        <p style={{ color: C.cream, fontSize: 14, fontWeight: 500, margin: "0 0 8px" }}>Электронная почта</p>
+        <input
+          type="email" inputMode="email" autoCapitalize="none" value={email} placeholder="mama@mail.ru"
+          onChange={(e) => setEmail(e.target.value)}
+          style={{ width: "100%", boxSizing: "border-box", background: C.bg, border: `1.5px solid ${C.line}`, borderRadius: 10, padding: "12px", color: C.cream, fontSize: 15, fontFamily: "inherit", outline: "none" }}
+        />
+      </div>
+      {err && <p style={{ color: C.warn, fontSize: 12.5, margin: "10px 4px 0" }}>{err}</p>}
+      <button onClick={send} disabled={busy} style={{
+        width: "100%", marginTop: 16, background: C.mint, color: C.bg, border: "none", borderRadius: 16,
+        padding: "17px", fontSize: 15.5, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
+        opacity: busy ? 0.6 : 1,
+      }}>{busy ? "Отправляем…" : "Получить ссылку для входа"}</button>
+      <p style={{ color: C.creamDim, fontSize: 10.5, textAlign: "center", margin: "13px 10px 0", lineHeight: 1.5, opacity: 0.85 }}>
+        Ваши записи из этого телефона никуда не денутся — после входа они привяжутся к аккаунту.
+      </p>
+    </SetupShell>
+  );
+}
+
 function SetupShell({ title, sub, children }) {
   return (
     <div style={{ minHeight: "100vh", background: C.bg, display: "flex", justifyContent: "center", fontFamily: "'Inter', system-ui, sans-serif" }}>
